@@ -1,0 +1,24 @@
+services:
+  jsyproxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jsyproxy
+    ports:
+      - "3105:3000"
+    environment:
+      - PORT=3000
+      - TOKEN=${TOKEN:-PKenOMF2rAwf1df}
+      - UPSTREAM_URL=${UPSTREAM_URL:-https://api.ajin168.com/api/v1/user/getSubscribe}
+      - AUTHORIZATION=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpZCI6NDE3OTIsInNlc3Npb24iOiI4ZmQ3MDllYjMyMzYzZmY4NzI4MmE0MGU4YWJiNjMwNSJ9.Bdj9LiRaBKQbgHgjzDWcl9hLrd-xHg9PI9y-XTCl7kU
+      - USER_AGENT=${USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36}
+      - HOST=${HOST:-api.ajin168.com}
+      - ORIGIN=${ORIGIN:-https://w4.rouhe88.com}
+      - REFERER=${REFERER:-https://w4.rouhe88.com/}
+    restart: unless-stopped
+    networks:
+      - jsyproxy-network
+
+networks:
+  jsyproxy-network:
+    driver: bridge
