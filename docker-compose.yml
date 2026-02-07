@@ -8,13 +8,10 @@ services:
       - "3105:3000"
     environment:
       - PORT=3000
-      - TOKEN=${TOKEN:-PKenOMF2rAwf1df}
-      - UPSTREAM_URL=${UPSTREAM_URL:-https://api.ajin168.com/api/v1/user/getSubscribe}
-      - AUTHORIZATION=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpZCI6NDE3OTIsInNlc3Npb24iOiI4ZmQ3MDllYjMyMzYzZmY4NzI4MmE0MGU4YWJiNjMwNSJ9.Bdj9LiRaBKQbgHgjzDWcl9hLrd-xHg9PI9y-XTCl7kU
-      - USER_AGENT=${USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36}
-      - HOST=${HOST:-api.ajin168.com}
-      - ORIGIN=${ORIGIN:-https://w4.rouhe88.com}
-      - REFERER=${REFERER:-https://w4.rouhe88.com/}
+      - ACCESS_KEYS=${ACCESS_KEYS:-}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-change_me}
+      - DEFAULT_REFRESH_INTERVAL=${DEFAULT_REFRESH_INTERVAL:-10m}
+      - DATA_FILE=${DATA_FILE:-data/state.json}
     restart: unless-stopped
     networks:
       - jsyproxy-network

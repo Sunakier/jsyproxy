@@ -26,11 +26,30 @@ func main() {
 	router.Use(gin.Recovery())
 
 	// 创建订阅处理器
-	subscribeHandler := handlers.NewSubscribeHandler(cfg)
+	subscribeHandler, err := handlers.NewSubscribeHandler(cfg)
+	if err != nil {
+		log.Fatalf("初始化订阅处理器失败: %v", err)
+	}
+	subscribeHandler.StartAutoRefresh()
 
 	// 设置路由
-	// 只允许 /apix/getSubscribe 接口访问，其他返回403
-	router.GET("/apix/getSubscribe", middleware.TokenAuth(cfg.Token), subscribeHandler.GetSubscribe)
+	router.GET("/apix/getSubscribe", subscribeHandler.GetSubscribe)
+	router.GET("/admin", subscribeHandler.AdminPage)
+	router.POST("/admin/api/login", subscribeHandler.AdminLogin)
+
+	adminAuth := middleware.AdminAuth(subscribeHandler.ValidateAdminSession)
+	adminAPI := router.Group("/admin/api", adminAuth)
+	{
+		adminAPI.POST("/logout", subscribeHandler.AdminLogout)
+		adminAPI.GET("/status", subscribeHandler.AdminStatus)
+		adminAPI.GET("/settings", subscribeHandler.AdminGetSettings)
+		adminAPI.PUT("/settings", subscribeHandler.AdminUpdateSettings)
+		adminAPI.POST("/refresh", subscribeHandler.AdminManualRefresh)
+		adminAPI.GET("/keys", subscribeHandler.AdminListKeys)
+		adminAPI.POST("/keys", subscribeHandler.AdminAddKey)
+		adminAPI.DELETE("/keys/:key", subscribeHandler.AdminDeleteKey)
+		adminAPI.GET("/logs", subscribeHandler.AdminGetLogs)
+	}
 
 	// 处理所有其他路由，返回403
 	router.NoRoute(func(c *gin.Context) {

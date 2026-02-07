@@ -3,20 +3,17 @@ package config
 import (
 	"log"
 	"os"
-	"strconv"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
 
 type Config struct {
-	Port          string
-	Token         string
-	UpstreamURL   string
-	Authorization string
-	UserAgent     string
-	Host          string
-	Origin        string
-	Referer       string
+	Port                   string
+	AdminPassword          string
+	DataFile               string
+	DefaultRefreshInterval string
+	BootstrapAccessKeys    []string
 }
 
 func Load() *Config {
@@ -24,22 +21,18 @@ func Load() *Config {
 	_ = godotenv.Load() // 忽略错误，优先使用环境变量
 
 	config := &Config{
-		Port:          getEnv("PORT", "3000"),
-		Token:         getEnv("TOKEN", "PKenOMF2rAwf1df"),
-		UpstreamURL:   getEnv("UPSTREAM_URL", "https://api.ajin168.com/api/v1/user/getSubscribe"),
-		Authorization: getEnv("AUTHORIZATION", ""),
-		UserAgent:     getEnv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"),
-		Host:          getEnv("HOST", "api.ajin168.com"),
-		Origin:        getEnv("ORIGIN", "https://w4.rouhe88.com"),
-		Referer:       getEnv("REFERER", "https://w4.rouhe88.com/"),
+		Port:                   getEnv("PORT", "3000"),
+		AdminPassword:          getEnv("ADMIN_PASSWORD", ""),
+		DataFile:               getEnv("DATA_FILE", "data/state.json"),
+		DefaultRefreshInterval: getEnv("DEFAULT_REFRESH_INTERVAL", "10m"),
+	}
+	config.BootstrapAccessKeys = parseCSV(getEnv("ACCESS_KEYS", ""))
+
+	if config.AdminPassword == "" {
+		log.Fatal("ADMIN_PASSWORD 环境变量是必需的，请设置后重新启动")
 	}
 
-	// 验证必需的配置
-	if config.Authorization == "" {
-		log.Fatal("AUTHORIZATION 环境变量是必需的，请设置后重新启动")
-	}
-
-	log.Printf("配置加载完成 - 端口: %s, 上游URL: %s", config.Port, config.UpstreamURL)
+	log.Printf("配置加载完成 - 端口: %s, BootstrapAccessKeys数量: %d, 默认刷新周期: %s", config.Port, len(config.BootstrapAccessKeys), config.DefaultRefreshInterval)
 	return config
 }
 
@@ -50,11 +43,20 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-func getEnvAsInt(key string, defaultValue int) int {
-	if value := os.Getenv(key); value != "" {
-		if intValue, err := strconv.Atoi(value); err == nil {
-			return intValue
+func parseCSV(raw string) []string {
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	seen := make(map[string]struct{})
+	for _, item := range parts {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			continue
 		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		result = append(result, trimmed)
 	}
-	return defaultValue
+	return result
 }

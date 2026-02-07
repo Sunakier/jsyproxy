@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>JSYProxy Admin</title>
+  <style>
+    body { font-family: sans-serif; margin: 24px; max-width: 1080px; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    input, button { padding: 8px; }
+    input { min-width: 240px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border: 1px solid #ddd; padding: 8px; font-size: 12px; }
+    #app { display: none; }
+    #loginError, #settingsError { color: #c00; }
+    .status-grid { display: grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); gap: 8px; }
+  </style>
+</head>
+<body>
+  <div id="login" class="card">
+    <h2>后台登录</h2>
+    <div class="row">
+      <input id="password" type="password" placeholder="ADMIN_PASSWORD" />
+      <button onclick="login()">登录</button>
+    </div>
+    <div id="loginError"></div>
+  </div>
+
+  <div id="app">
+    <div class="card">
+      <h2>状态</h2>
+      <div class="row">
+        <button onclick="refreshAll()">刷新</button>
+        <button onclick="manualRefresh()">手动刷新缓存</button>
+        <button onclick="logout()">退出</button>
+      </div>
+      <div class="status-grid">
+        <div><b>缓存更新时间:</b> <span id="cacheUpdatedAt">-</span></div>
+        <div><b>刷新周期:</b> <span id="refreshInterval">-</span></div>
+        <div><b>流量:</b> <span id="usageText">-</span></div>
+        <div><b>到期/重置:</b> <span id="expiryText">-</span></div>
+        <div><b>套餐:</b> <span id="planName">-</span></div>
+        <div><b>配置完成:</b> <span id="configured">-</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>上游动态配置</h2>
+      <div class="row"><input id="upstreamUrl" placeholder="upstream_url (例如: https://xxx/api/v1/user/getSubscribe)" /></div>
+      <div class="row"><input id="authorization" placeholder="authorization" /></div>
+      <div class="row"><input id="requestUserAgent" placeholder="request_user_agent" /></div>
+      <div class="row"><input id="host" placeholder="host" /><input id="origin" placeholder="origin" /><input id="referer" placeholder="referer" /></div>
+      <div class="row"><input id="refreshIntervalInput" placeholder="refresh_interval (10m / 5m / 125s)" /></div>
+      <div class="row">
+        <button onclick="saveSettings()">保存配置</button>
+      </div>
+      <div id="settingsError"></div>
+    </div>
+
+    <div class="card">
+      <h2>多Key管理</h2>
+      <div class="row">
+        <input id="newKey" placeholder="key" />
+        <input id="newKeyName" placeholder="name(可选)" />
+        <button onclick="addKey()">新增Key</button>
+      </div>
+      <table>
+        <thead><tr><th>Key</th><th>Name</th><th>Enabled</th><th>CreatedAt</th><th>操作</th></tr></thead>
+        <tbody id="keys"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>客户端更新日志</h2>
+      <table>
+        <thead><tr><th>Time</th><th>Key</th><th>IP</th><th>CacheHit</th><th>Status</th><th>Message</th></tr></thead>
+        <tbody id="logs"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    async function api(path, options = {}) {
+      const res = await fetch(path, { credentials: 'include', headers: { 'Content-Type': 'application/json' }, ...options });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || '请求失败');
+      return data;
+    }
+
+    async function login() {
+      document.getElementById('loginError').textContent = '';
+      try {
+        await api('/admin/api/login', { method: 'POST', body: JSON.stringify({ password: document.getElementById('password').value }) });
+        document.getElementById('login').style.display = 'none';
+        document.getElementById('app').style.display = 'block';
+        await refreshAll();
+      } catch (e) {
+        document.getElementById('loginError').textContent = e.message;
+      }
+    }
+
+    async function logout() {
+      await api('/admin/api/logout', { method: 'POST' });
+      document.getElementById('app').style.display = 'none';
+      document.getElementById('login').style.display = 'block';
+    }
+
+    async function refreshAll() {
+      await Promise.all([loadStatus(), loadSettings(), loadKeys(), loadLogs()]);
+    }
+
+    async function manualRefresh() {
+      await api('/admin/api/refresh', { method: 'POST' });
+      await loadStatus();
+      alert('缓存更新成功');
+    }
+
+    async function loadStatus() {
+      const data = await api('/admin/api/status');
+      document.getElementById('cacheUpdatedAt').textContent = data.cache_updated_at || '-';
+      document.getElementById('refreshInterval').textContent = data.refresh_interval || '-';
+      document.getElementById('configured').textContent = data.upstream_configured ? '是' : '否';
+
+      const t = data.traffic || {};
+      document.getElementById('usageText').textContent = t.usage_text || '-';
+      document.getElementById('expiryText').textContent = t.expiry_text || '-';
+      document.getElementById('planName').textContent = t.plan_name || '-';
+    }
+
+    async function loadSettings() {
+      const data = await api('/admin/api/settings');
+      const s = data.settings || {};
+      document.getElementById('upstreamUrl').value = s.upstream_url || '';
+      document.getElementById('authorization').value = s.authorization || '';
+      document.getElementById('requestUserAgent').value = s.request_user_agent || '';
+      document.getElementById('host').value = s.host || '';
+      document.getElementById('origin').value = s.origin || '';
+      document.getElementById('referer').value = s.referer || '';
+      document.getElementById('refreshIntervalInput').value = s.refresh_interval || '10m';
+    }
+
+    async function saveSettings() {
+      document.getElementById('settingsError').textContent = '';
+      try {
+        await api('/admin/api/settings', {
+          method: 'PUT',
+          body: JSON.stringify({
+            upstream_url: document.getElementById('upstreamUrl').value.trim(),
+            authorization: document.getElementById('authorization').value.trim(),
+            request_user_agent: document.getElementById('requestUserAgent').value.trim(),
+            host: document.getElementById('host').value.trim(),
+            origin: document.getElementById('origin').value.trim(),
+            referer: document.getElementById('referer').value.trim(),
+            refresh_interval: document.getElementById('refreshIntervalInput').value.trim(),
+          })
+        });
+        await refreshAll();
+      } catch (e) {
+        document.getElementById('settingsError').textContent = e.message;
+      }
+    }
+
+    async function loadKeys() {
+      const data = await api('/admin/api/keys');
+      const tbody = document.getElementById('keys');
+      tbody.innerHTML = '';
+      (data.keys || []).forEach((k) => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${k.key}</td><td>${k.name}</td><td>${k.enabled}</td><td>${k.created_at || ''}</td><td><button>删除</button></td>`;
+        tr.querySelector('button').onclick = async () => {
+          await api('/admin/api/keys/' + encodeURIComponent(k.key), { method: 'DELETE' });
+          await Promise.all([loadKeys(), loadStatus()]);
+        };
+        tbody.appendChild(tr);
+      });
+    }
+
+    async function addKey() {
+      const key = document.getElementById('newKey').value.trim();
+      const name = document.getElementById('newKeyName').value.trim();
+      if (!key) return;
+      await api('/admin/api/keys', { method: 'POST', body: JSON.stringify({ key, name }) });
+      document.getElementById('newKey').value = '';
+      document.getElementById('newKeyName').value = '';
+      await Promise.all([loadKeys(), loadStatus()]);
+    }
+
+    async function loadLogs() {
+      const data = await api('/admin/api/logs?limit=200');
+      const tbody = document.getElementById('logs');
+      tbody.innerHTML = '';
+      (data.logs || []).forEach((l) => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${l.time || ''}</td><td>${l.key || ''}</td><td>${l.client_ip || ''}</td><td>${l.cache_hit}</td><td>${l.status || ''}</td><td>${l.message || ''}</td>`;
+        tbody.appendChild(tr);
+      });
+    }
+  </script>
+</body>
+</html>
