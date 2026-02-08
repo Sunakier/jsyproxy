@@ -1,201 +1,1002 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>JSYProxy Admin</title>
-  <style>
-    body { font-family: sans-serif; margin: 24px; max-width: 1080px; }
-    .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-    input, button { padding: 8px; }
-    input { min-width: 240px; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { border: 1px solid #ddd; padding: 8px; font-size: 12px; }
-    #app { display: none; }
-    #loginError, #settingsError { color: #c00; }
-    .status-grid { display: grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); gap: 8px; }
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JsyProxy 管理后台</title>
+    <style>
+        :root {
+            --primary: #3b82f6;
+            --primary-hover: #2563eb;
+            --bg-body: #f3f4f6;
+            --bg-sidebar: #1f2937;
+            --bg-card: #ffffff;
+            --text-main: #111827;
+            --text-muted: #6b7280;
+            --text-light: #f9fafb;
+            --border: #e5e7eb;
+            --danger: #ef4444;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --radius: 8px;
+            --shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06);
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg-body: #111827;
+                --bg-sidebar: #0f172a;
+                --bg-card: #1f2937;
+                --text-main: #f9fafb;
+                --text-muted: #9ca3af;
+                --border: #374151;
+            }
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        body { background-color: var(--bg-body); color: var(--text-main); min-height: 100vh; }
+        
+        .hidden { display: none !important; }
+        .flex { display: flex; }
+        .flex-col { flex-direction: column; }
+        .items-center { align-items: center; }
+        .justify-between { justify-content: space-between; }
+        .gap-2 { gap: 0.5rem; }
+        .gap-4 { gap: 1rem; }
+        .w-full { width: 100%; }
+        .mt-4 { margin-top: 1rem; }
+        .mb-4 { margin-bottom: 1rem; }
+        .text-sm { font-size: 0.875rem; }
+        .text-danger { color: var(--danger); }
+        .text-success { color: var(--success); }
+        .text-muted { color: var(--text-muted); }
+        
+        .btn { padding: 0.5rem 1rem; border-radius: var(--radius); border: none; cursor: pointer; font-weight: 500; transition: all 0.2s; font-size: 0.9rem; display: inline-flex; align-items: center; gap: 0.5rem; }
+        .btn-primary { background: var(--primary); color: white; }
+        .btn-primary:hover { background: var(--primary-hover); }
+        .btn-danger { background: var(--danger); color: white; }
+        .btn-secondary { background: transparent; border: 1px solid var(--border); color: var(--text-main); }
+        .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.8rem; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .input, .select { width: 100%; padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-card); color: var(--text-main); font-size: 0.9rem; }
+        .input:focus, .select:focus { outline: 2px solid var(--primary); border-color: transparent; }
+        
+        .card { background: var(--bg-card); border-radius: var(--radius); padding: 1.5rem; box-shadow: var(--shadow); margin-bottom: 1rem; }
+        .card-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem; }
+        
+        #login-view { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: var(--bg-body); z-index: 100; }
+        .login-box { width: 100%; max-width: 400px; }
+
+        .app-container { display: flex; min-height: 100vh; }
+        .sidebar { width: 240px; background: var(--bg-sidebar); color: var(--text-light); display: flex; flex-direction: column; padding: 1rem; position: fixed; top: 0; left: 0; bottom: 0; }
+        .sidebar-title { font-size: 1.25rem; font-weight: bold; margin-bottom: 2rem; padding: 0.5rem; }
+        .nav-item { padding: 0.75rem 1rem; border-radius: var(--radius); cursor: pointer; margin-bottom: 0.25rem; color: #d1d5db; transition: all 0.2s; }
+        .nav-item:hover, .nav-item.active { background: rgba(255,255,255,0.1); color: white; }
+        
+        .main-content { flex: 1; margin-left: 240px; padding: 2rem; min-height: 100vh; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; flex-wrap: wrap; gap: 1rem; }
+        .page-title { font-size: 1.5rem; font-weight: 600; }
+
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+        .stat-card { text-align: center; }
+        .stat-value { font-size: 2rem; font-weight: bold; color: var(--primary); }
+        .stat-label { color: var(--text-muted); font-size: 0.875rem; margin-top: 0.25rem; }
+
+        .upstream-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1rem; }
+        .upstream-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; }
+        .upstream-name { font-weight: 600; font-size: 1.1rem; }
+        .upstream-detail { font-size: 0.875rem; color: var(--text-muted); line-height: 1.6; }
+        .upstream-traffic { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+        .ua-cache-table-wrap { margin-top: 0.75rem; }
+        .ua-cache-table-wrap table th,
+        .ua-cache-table-wrap table td { padding: 0.4rem 0.5rem; font-size: 0.78rem; }
+
+        .table-container { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; text-align: left; }
+        th, td { padding: 0.75rem 1rem; border-bottom: 1px solid var(--border); }
+        th { font-weight: 600; color: var(--text-muted); font-size: 0.8rem; text-transform: uppercase; }
+
+        .badge { padding: 0.2rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; }
+        .badge-success { background: rgba(16, 185, 129, 0.15); color: var(--success); }
+        .badge-warning { background: rgba(245, 158, 11, 0.15); color: var(--warning); }
+        .badge-danger { background: rgba(239, 68, 68, 0.15); color: var(--danger); }
+        .badge-info { background: rgba(59, 130, 246, 0.15); color: var(--primary); }
+
+        .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 1rem; }
+        .modal { background: var(--bg-card); width: 100%; max-width: 500px; border-radius: var(--radius); box-shadow: var(--shadow); max-height: 90vh; overflow-y: auto; }
+        .modal-header { padding: 1rem 1.5rem; border-bottom: 1px solid var(--border); font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+        .modal-body { padding: 1.5rem; }
+        .modal-footer { padding: 1rem 1.5rem; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 0.5rem; }
+
+        .form-group { margin-bottom: 1rem; }
+        .form-label { display: block; margin-bottom: 0.5rem; font-size: 0.875rem; font-weight: 500; }
+        .form-hint { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.25rem; }
+
+        .pagination { display: flex; justify-content: center; align-items: center; gap: 1rem; margin-top: 1.5rem; }
+
+        #toast-container { position: fixed; bottom: 1rem; right: 1rem; z-index: 100; display: flex; flex-direction: column; gap: 0.5rem; }
+        .toast { padding: 0.75rem 1rem; border-radius: var(--radius); background: var(--bg-sidebar); color: white; font-size: 0.875rem; box-shadow: var(--shadow); animation: slideIn 0.3s ease; min-width: 200px; }
+        .toast.error { border-left: 4px solid var(--danger); }
+        .toast.success { border-left: 4px solid var(--success); }
+        @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+        @media (max-width: 768px) {
+            .sidebar { transform: translateX(-100%); z-index: 40; transition: transform 0.3s; }
+            .sidebar.open { transform: translateX(0); }
+            .main-content { margin-left: 0; }
+            .menu-toggle { display: block !important; }
+        }
+    </style>
 </head>
 <body>
-  <div id="login" class="card">
-    <h2>后台登录</h2>
-    <div class="row">
-      <input id="password" type="password" placeholder="ADMIN_PASSWORD" />
-      <button onclick="login()">登录</button>
-    </div>
-    <div id="loginError"></div>
-  </div>
-
-  <div id="app">
-    <div class="card">
-      <h2>状态</h2>
-      <div class="row">
-        <button onclick="refreshAll()">刷新</button>
-        <button onclick="manualRefresh()">手动刷新缓存</button>
-        <button onclick="logout()">退出</button>
-      </div>
-      <div class="status-grid">
-        <div><b>缓存更新时间:</b> <span id="cacheUpdatedAt">-</span></div>
-        <div><b>刷新周期:</b> <span id="refreshInterval">-</span></div>
-        <div><b>流量:</b> <span id="usageText">-</span></div>
-        <div><b>到期/重置:</b> <span id="expiryText">-</span></div>
-        <div><b>套餐:</b> <span id="planName">-</span></div>
-        <div><b>配置完成:</b> <span id="configured">-</span></div>
-      </div>
+    <div id="login-view">
+        <div class="card login-box">
+            <h2 style="text-align: center; margin-bottom: 1.5rem;">JsyProxy 管理后台</h2>
+            <form id="login-form">
+                <div class="form-group">
+                    <input type="password" id="login-password" class="input" placeholder="请输入管理密码" required>
+                </div>
+                <button type="submit" class="btn btn-primary w-full">登录</button>
+                <div id="login-error" class="text-danger text-sm mt-4" style="text-align: center;"></div>
+            </form>
+        </div>
     </div>
 
-    <div class="card">
-      <h2>上游动态配置</h2>
-      <div class="row"><input id="upstreamUrl" placeholder="upstream_url (例如: https://xxx/api/v1/user/getSubscribe)" /></div>
-      <div class="row"><input id="authorization" placeholder="authorization" /></div>
-      <div class="row"><input id="requestUserAgent" placeholder="request_user_agent" /></div>
-      <div class="row"><input id="host" placeholder="host" /><input id="origin" placeholder="origin" /><input id="referer" placeholder="referer" /></div>
-      <div class="row"><input id="refreshIntervalInput" placeholder="refresh_interval (10m / 5m / 125s)" /></div>
-      <div class="row">
-        <button onclick="saveSettings()">保存配置</button>
-      </div>
-      <div id="settingsError"></div>
+    <div id="app-view" class="hidden">
+        <div class="app-container">
+            <div class="sidebar" id="sidebar">
+                <div class="sidebar-title">JsyProxy</div>
+                <nav id="nav-menu">
+                    <div class="nav-item active" data-view="dashboard">概览</div>
+                    <div class="nav-item" data-view="upstreams">上游管理</div>
+                    <div class="nav-item" data-view="keys">Key管理</div>
+                    <div class="nav-item" data-view="logs">访问日志</div>
+                    <div class="nav-item" data-view="settings">全局设置</div>
+                </nav>
+                <div style="margin-top: auto;">
+                    <div class="nav-item" id="logout-btn">退出登录</div>
+                </div>
+            </div>
+
+            <div class="main-content">
+                <div class="header">
+                    <div class="flex items-center gap-4">
+                        <button class="btn btn-secondary btn-sm menu-toggle" id="menu-toggle" style="display: none;">☰</button>
+                        <h1 class="page-title" id="page-title">概览</h1>
+                    </div>
+                    <div id="header-actions" class="flex gap-2"></div>
+                </div>
+                <div id="content-area"></div>
+            </div>
+        </div>
     </div>
 
-    <div class="card">
-      <h2>多Key管理</h2>
-      <div class="row">
-        <input id="newKey" placeholder="key" />
-        <input id="newKeyName" placeholder="name(可选)" />
-        <button onclick="addKey()">新增Key</button>
-      </div>
-      <table>
-        <thead><tr><th>Key</th><th>Name</th><th>Enabled</th><th>CreatedAt</th><th>操作</th></tr></thead>
-        <tbody id="keys"></tbody>
-      </table>
-    </div>
+    <div id="modal-container"></div>
+    <div id="toast-container"></div>
 
-    <div class="card">
-      <h2>客户端更新日志</h2>
-      <table>
-        <thead><tr><th>Time</th><th>Key</th><th>IP</th><th>CacheHit</th><th>Status</th><th>Message</th></tr></thead>
-        <tbody id="logs"></tbody>
-      </table>
-    </div>
-  </div>
+    <script>
+        const $ = (sel) => document.querySelector(sel);
+        const $$ = (sel) => document.querySelectorAll(sel);
 
-  <script>
-    async function api(path, options = {}) {
-      const res = await fetch(path, { credentials: 'include', headers: { 'Content-Type': 'application/json' }, ...options });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || '请求失败');
-      return data;
-    }
+        const state = { view: 'dashboard', logPage: 1 };
 
-    async function login() {
-      document.getElementById('loginError').textContent = '';
-      try {
-        await api('/admin/api/login', { method: 'POST', body: JSON.stringify({ password: document.getElementById('password').value }) });
-        document.getElementById('login').style.display = 'none';
-        document.getElementById('app').style.display = 'block';
-        await refreshAll();
-      } catch (e) {
-        document.getElementById('loginError').textContent = e.message;
-      }
-    }
+        async function api(path, options = {}) {
+            const res = await fetch('/admin/api' + path, {
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json', ...options.headers },
+                ...options
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                if (res.status === 401) {
+                    showLogin();
+                }
+                throw new Error(data.error || 'Request failed');
+            }
+            return data;
+        }
 
-    async function logout() {
-      await api('/admin/api/logout', { method: 'POST' });
-      document.getElementById('app').style.display = 'none';
-      document.getElementById('login').style.display = 'block';
-    }
+        function showToast(msg, type = 'info') {
+            const t = document.createElement('div');
+            t.className = 'toast ' + type;
+            t.textContent = msg;
+            $('#toast-container').appendChild(t);
+            setTimeout(() => t.remove(), 3500);
+        }
 
-    async function refreshAll() {
-      await Promise.all([loadStatus(), loadSettings(), loadKeys(), loadLogs()]);
-    }
+        function showLogin() {
+            $('#login-view').classList.remove('hidden');
+            $('#app-view').classList.add('hidden');
+        }
 
-    async function manualRefresh() {
-      await api('/admin/api/refresh', { method: 'POST' });
-      await loadStatus();
-      alert('缓存更新成功');
-    }
+        function showApp() {
+            $('#login-view').classList.add('hidden');
+            $('#app-view').classList.remove('hidden');
+            navigate('dashboard');
+        }
 
-    async function loadStatus() {
-      const data = await api('/admin/api/status');
-      document.getElementById('cacheUpdatedAt').textContent = data.cache_updated_at || '-';
-      document.getElementById('refreshInterval').textContent = data.refresh_interval || '-';
-      document.getElementById('configured').textContent = data.upstream_configured ? '是' : '否';
+        function navigate(view) {
+            state.view = view;
+            $$('.nav-item[data-view]').forEach(n => {
+                n.classList.toggle('active', n.dataset.view === view);
+            });
+            $('#header-actions').innerHTML = '';
+            
+            const titles = { dashboard: '概览', upstreams: '上游管理', keys: 'Key管理', logs: '访问日志', settings: '全局设置' };
+            $('#page-title').textContent = titles[view] || view;
 
-      const t = data.traffic || {};
-      document.getElementById('usageText').textContent = t.usage_text || '-';
-      document.getElementById('expiryText').textContent = t.expiry_text || '-';
-      document.getElementById('planName').textContent = t.plan_name || '-';
-    }
+            switch(view) {
+                case 'dashboard': renderDashboard(); break;
+                case 'upstreams': renderUpstreams(); break;
+                case 'keys': renderKeys(); break;
+                case 'logs': renderLogs(); break;
+                case 'settings': renderSettings(); break;
+            }
+        }
 
-    async function loadSettings() {
-      const data = await api('/admin/api/settings');
-      const s = data.settings || {};
-      document.getElementById('upstreamUrl').value = s.upstream_url || '';
-      document.getElementById('authorization').value = s.authorization || '';
-      document.getElementById('requestUserAgent').value = s.request_user_agent || '';
-      document.getElementById('host').value = s.host || '';
-      document.getElementById('origin').value = s.origin || '';
-      document.getElementById('referer').value = s.referer || '';
-      document.getElementById('refreshIntervalInput').value = s.refresh_interval || '10m';
-    }
+        async function renderDashboard() {
+            const content = $('#content-area');
+            content.innerHTML = '<div class="text-muted">加载中...</div>';
+            
+            try {
+                const [data, cacheStatusData] = await Promise.all([
+                    api('/status'),
+                    api('/cache-status')
+                ]);
+                const cacheStatusMap = {};
+                (cacheStatusData.upstreams || []).forEach(u => {
+                    cacheStatusMap[u.id] = u;
+                });
+                
+                let html = `
+                    <div class="stats-grid">
+                        <div class="card stat-card">
+                            <div class="stat-value">${data.upstream_count || 0}</div>
+                            <div class="stat-label">上游数量</div>
+                        </div>
+                        <div class="card stat-card">
+                            <div class="stat-value">${data.key_count || 0}</div>
+                            <div class="stat-label">Key数量</div>
+                        </div>
+                        <div class="card stat-card">
+                            <div class="stat-value">${data.log_count || 0}</div>
+                            <div class="stat-label">日志条数</div>
+                        </div>
+                    </div>
+                    <h3 class="mb-4">上游状态</h3>
+                    <div class="upstream-grid">
+                `;
 
-    async function saveSettings() {
-      document.getElementById('settingsError').textContent = '';
-      try {
-        await api('/admin/api/settings', {
-          method: 'PUT',
-          body: JSON.stringify({
-            upstream_url: document.getElementById('upstreamUrl').value.trim(),
-            authorization: document.getElementById('authorization').value.trim(),
-            request_user_agent: document.getElementById('requestUserAgent').value.trim(),
-            host: document.getElementById('host').value.trim(),
-            origin: document.getElementById('origin').value.trim(),
-            referer: document.getElementById('referer').value.trim(),
-            refresh_interval: document.getElementById('refreshIntervalInput').value.trim(),
-          })
-        });
-        await refreshAll();
-      } catch (e) {
-        document.getElementById('settingsError').textContent = e.message;
-      }
-    }
+                if (data.upstreams && data.upstreams.length > 0) {
+                    data.upstreams.forEach(u => {
+                        const strategyText = u.cache_strategy === 'force' ? '强制缓存' : '懒缓存';
+                        const statusBadge = u.enabled 
+                            ? '<span class="badge badge-success">启用</span>' 
+                            : '<span class="badge badge-danger">禁用</span>';
+                        
+                        let trafficHtml = '';
+                        if (u.traffic) {
+                            trafficHtml = `
+                                <div class="upstream-traffic">
+                                    <div><strong>${escapeHtml(u.traffic.plan_name || '未知套餐')}</strong></div>
+                                    <div class="text-sm text-muted">${escapeHtml(u.traffic.usage_text || '-')}</div>
+                                    <div class="text-sm text-muted">${escapeHtml(u.traffic.expiry_text || '-')}</div>
+                                </div>
+                            `;
+                        }
 
-    async function loadKeys() {
-      const data = await api('/admin/api/keys');
-      const tbody = document.getElementById('keys');
-      tbody.innerHTML = '';
-      (data.keys || []).forEach((k) => {
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${k.key}</td><td>${k.name}</td><td>${k.enabled}</td><td>${k.created_at || ''}</td><td><button>删除</button></td>`;
-        tr.querySelector('button').onclick = async () => {
-          await api('/admin/api/keys/' + encodeURIComponent(k.key), { method: 'DELETE' });
-          await Promise.all([loadKeys(), loadStatus()]);
-        };
-        tbody.appendChild(tr);
-      });
-    }
+                        const uaRows = (cacheStatusMap[u.id]?.ua_cache_statuses || []).map(item => {
+                            const uaText = item.is_default ? '默认UA' : (item.user_agent || '-');
+                            const uaDisplay = item.is_default
+                                ? '<span class="badge badge-info">默认UA</span>'
+                                : `<span title="${escapeHtml(uaText)}">${escapeHtml(uaText.length > 48 ? uaText.slice(0, 48) + '...' : uaText)}</span>`;
+                            return `
+                                <tr>
+                                    <td>${uaDisplay}</td>
+                                    <td>${item.total_requests || 0}</td>
+                                    <td>${item.today_requests || 0}</td>
+                                    <td>${item.month_requests || 0}</td>
+                                </tr>
+                            `;
+                        }).join('');
 
-    async function addKey() {
-      const key = document.getElementById('newKey').value.trim();
-      const name = document.getElementById('newKeyName').value.trim();
-      if (!key) return;
-      await api('/admin/api/keys', { method: 'POST', body: JSON.stringify({ key, name }) });
-      document.getElementById('newKey').value = '';
-      document.getElementById('newKeyName').value = '';
-      await Promise.all([loadKeys(), loadStatus()]);
-    }
+                        const uaTableHtml = uaRows
+                            ? `
+                                <div class="ua-cache-table-wrap table-container">
+                                    <table>
+                                        <thead>
+                                            <tr><th>UA</th><th>总请求</th><th>今日</th><th>本月</th></tr>
+                                        </thead>
+                                        <tbody>${uaRows}</tbody>
+                                    </table>
+                                </div>
+                              `
+                            : '<div class="text-sm text-muted mt-4">暂无UA缓存统计</div>';
 
-    async function loadLogs() {
-      const data = await api('/admin/api/logs?limit=200');
-      const tbody = document.getElementById('logs');
-      tbody.innerHTML = '';
-      (data.logs || []).forEach((l) => {
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${l.time || ''}</td><td>${l.key || ''}</td><td>${l.client_ip || ''}</td><td>${l.cache_hit}</td><td>${l.status || ''}</td><td>${l.message || ''}</td>`;
-        tbody.appendChild(tr);
-      });
-    }
-  </script>
+                        html += `
+                            <div class="card">
+                                <div class="upstream-header">
+                                    <span class="upstream-name">${escapeHtml(u.name || '未命名')}</span>
+                                    ${statusBadge}
+                                </div>
+                                <div class="upstream-detail">
+                                    <div>策略: ${strategyText}</div>
+                                    <div>刷新周期: ${escapeHtml(u.refresh_interval || '10m')}</div>
+                                    <div>缓存状态: ${u.has_cache ? '有效' : '无缓存'}</div>
+                                    ${u.cache_updated_at ? '<div>更新: ' + new Date(u.cache_updated_at).toLocaleString() + '</div>' : ''}
+                                </div>
+                                ${trafficHtml}
+                                ${uaTableHtml}
+                            </div>
+                        `;
+                    });
+                } else {
+                    html += '<div class="card text-muted">暂无上游配置，请先添加上游</div>';
+                }
+
+                html += '</div>';
+                content.innerHTML = html;
+            } catch (e) {
+                content.innerHTML = '<div class="text-danger">加载失败: ' + escapeHtml(e.message) + '</div>';
+            }
+        }
+
+        let cachedUpstreamsList = [];
+
+        async function renderUpstreams() {
+            const actions = $('#header-actions');
+            actions.innerHTML = '<button class="btn btn-primary" id="add-upstream-btn">+ 添加上游</button>';
+            $('#add-upstream-btn').onclick = () => openUpstreamModal();
+
+            const content = $('#content-area');
+            content.innerHTML = '<div class="text-muted">加载中...</div>';
+
+            try {
+                const data = await api('/upstreams');
+                cachedUpstreamsList = data.upstreams || [];
+
+                if (cachedUpstreamsList.length === 0) {
+                    content.innerHTML = '<div class="card text-muted">暂无上游，点击上方按钮添加</div>';
+                    return;
+                }
+
+                let html = '<div class="card table-container"><table><thead><tr><th>名称</th><th>策略</th><th>刷新周期</th><th>状态</th><th>操作</th></tr></thead><tbody>';
+                
+                cachedUpstreamsList.forEach((u, idx) => {
+                    const badge = u.enabled ? '<span class="badge badge-success">启用</span>' : '<span class="badge badge-danger">禁用</span>';
+                    const strategy = u.cache_strategy === 'force' ? '强制' : '懒加载';
+                    html += `
+                        <tr>
+                            <td><strong>${escapeHtml(u.name)}</strong><div class="text-sm text-muted">${escapeHtml(u.id.substring(0,8))}...</div></td>
+                            <td>${strategy}</td>
+                            <td>${escapeHtml(u.refresh_interval)}</td>
+                            <td>${badge}</td>
+                            <td>
+                                <div class="flex gap-2">
+                                    <button class="btn btn-secondary btn-sm" data-up-refresh="${u.id}">刷新</button>
+                                    <button class="btn btn-secondary btn-sm" data-up-dedupe="${u.id}">去重</button>
+                                    <button class="btn btn-primary btn-sm" data-up-idx="${idx}">编辑</button>
+                                    <button class="btn btn-danger btn-sm" data-up-del="${u.id}">删除</button>
+                                </div>
+                            </td>
+                        </tr>
+                    `;
+                });
+
+                html += '</tbody></table></div>';
+                content.innerHTML = html;
+
+                content.querySelectorAll('[data-up-refresh]').forEach(btn => {
+                    btn.onclick = () => refreshUpstream(btn.dataset.upRefresh);
+                });
+                content.querySelectorAll('[data-up-dedupe]').forEach(btn => {
+                    btn.onclick = () => dedupeUpstreamCache(btn.dataset.upDedupe);
+                });
+                content.querySelectorAll('[data-up-idx]').forEach(btn => {
+                    btn.onclick = () => {
+                        const idx = parseInt(btn.dataset.upIdx);
+                        openUpstreamModal(cachedUpstreamsList[idx]);
+                    };
+                });
+                content.querySelectorAll('[data-up-del]').forEach(btn => {
+                    btn.onclick = () => deleteUpstream(btn.dataset.upDel);
+                });
+            } catch (e) {
+                content.innerHTML = '<div class="text-danger">加载失败: ' + escapeHtml(e.message) + '</div>';
+            }
+        }
+
+        async function refreshUpstream(id) {
+            try {
+                await api('/upstreams/' + id + '/refresh', { method: 'POST' });
+                showToast('刷新成功', 'success');
+            } catch (e) {
+                showToast(e.message, 'error');
+            }
+        }
+
+        async function dedupeUpstreamCache(id) {
+            try {
+                const result = await api('/upstreams/' + id + '/dedupe', { method: 'POST' });
+                showToast(`去重完成：移除 ${result.removed || 0} 个，剩余 ${result.remain || 0} 个`, 'success');
+                renderUpstreams();
+            } catch (e) {
+                showToast(e.message, 'error');
+            }
+        }
+
+        async function deleteUpstream(id) {
+            if (!confirm('确定删除此上游？')) return;
+            try {
+                await api('/upstreams/' + id, { method: 'DELETE' });
+                showToast('已删除', 'success');
+                renderUpstreams();
+            } catch (e) {
+                showToast(e.message, 'error');
+            }
+        }
+
+        function openUpstreamModal(data = null) {
+            const isEdit = !!data;
+            const html = `
+                <div class="form-group">
+                    <label class="form-label">名称 *</label>
+                    <input type="text" class="input" id="up-name" value="${escapeHtml(data?.name || '')}" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">API端点地址 *</label>
+                    <input type="text" class="input" id="up-url" value="${escapeHtml(data?.api_endpoint || '')}" placeholder="https://..." required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Authorization</label>
+                    <input type="text" class="input" id="up-auth" value="${escapeHtml(data?.authorization || '')}">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">User-Agent</label>
+                    <input type="text" class="input" id="up-ua" value="${escapeHtml(data?.request_user_agent || '')}">
+                </div>
+                <div class="flex gap-2">
+                    <div class="form-group" style="flex:1">
+                        <label class="form-label">Host</label>
+                        <input type="text" class="input" id="up-host" value="${escapeHtml(data?.host || '')}">
+                    </div>
+                    <div class="form-group" style="flex:1">
+                        <label class="form-label">Origin</label>
+                        <input type="text" class="input" id="up-origin" value="${escapeHtml(data?.origin || '')}">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Referer</label>
+                    <input type="text" class="input" id="up-referer" value="${escapeHtml(data?.referer || '')}">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">自定义请求头</label>
+                    <div id="custom-headers-list"></div>
+                    <button type="button" class="btn btn-secondary btn-sm mt-4" id="add-header-btn">+ 添加请求头</button>
+                    <div class="form-hint">添加额外的请求头，如 Cookie、X-Custom-Header 等。上方固定字段优先级更高。</div>
+                </div>
+                <div class="flex gap-2">
+                    <div class="form-group" style="flex:1">
+                        <label class="form-label">刷新周期</label>
+                        <input type="text" class="input" id="up-interval" value="${escapeHtml(data?.refresh_interval || '10m')}" placeholder="10m / 5m / 1h">
+                    </div>
+                    <div class="form-group" style="flex:1">
+                        <label class="form-label">缓存策略</label>
+                        <select class="input" id="up-strategy">
+                            <option value="force" ${data?.cache_strategy === 'force' ? 'selected' : ''}>强制缓存</option>
+                            <option value="lazy" ${data?.cache_strategy === 'lazy' ? 'selected' : ''}>懒缓存</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label><input type="checkbox" id="up-enabled" ${!data || data.enabled ? 'checked' : ''}> 启用</label>
+                </div>
+            `;
+
+            showModal(isEdit ? '编辑上游' : '添加上游', html, async () => {
+                const customHeaders = {};
+                $$('#custom-headers-list .header-row').forEach(row => {
+                    const key = row.querySelector('.header-key').value.trim();
+                    const value = row.querySelector('.header-value').value.trim();
+                    if (key && value) {
+                        customHeaders[key] = value;
+                    }
+                });
+
+                const payload = {
+                    name: $('#up-name').value.trim(),
+                    api_endpoint: $('#up-url').value.trim(),
+                    authorization: $('#up-auth').value.trim(),
+                    request_user_agent: $('#up-ua').value.trim(),
+                    host: $('#up-host').value.trim(),
+                    origin: $('#up-origin').value.trim(),
+                    referer: $('#up-referer').value.trim(),
+                    custom_headers: customHeaders,
+                    refresh_interval: $('#up-interval').value.trim() || '10m',
+                    cache_strategy: $('#up-strategy').value,
+                    enabled: $('#up-enabled').checked
+                };
+
+                if (!payload.name) throw new Error('名称不能为空');
+
+                const url = isEdit ? '/upstreams/' + data.id : '/upstreams';
+                const method = isEdit ? 'PUT' : 'POST';
+                await api(url, { method, body: JSON.stringify(payload) });
+                showToast('保存成功', 'success');
+                renderUpstreams();
+                return true;
+            });
+
+            // Initialize custom headers list after modal is shown
+            initCustomHeadersList(data?.custom_headers || {});
+        }
+
+        let cachedUpstreams = [];
+        let cachedKeys = [];
+
+        async function renderKeys() {
+            const actions = $('#header-actions');
+            actions.innerHTML = `
+                <button class="btn btn-secondary" id="help-btn">使用说明</button>
+                <button class="btn btn-primary" id="add-key-btn">+ 添加Key</button>
+            `;
+            $('#add-key-btn').onclick = () => openKeyModal();
+            $('#help-btn').onclick = () => showHelpModal();
+
+            const content = $('#content-area');
+            content.innerHTML = '<div class="text-muted">加载中...</div>';
+
+            try {
+                const [keysData, upstreamsData] = await Promise.all([
+                    api('/keys'),
+                    api('/upstreams')
+                ]);
+                cachedKeys = keysData.keys || [];
+                cachedUpstreams = upstreamsData.upstreams || [];
+
+                if (cachedKeys.length === 0) {
+                    content.innerHTML = '<div class="card text-muted">暂无Key，点击上方按钮添加</div>';
+                    return;
+                }
+
+                let html = `
+                    <div class="card" style="margin-bottom: 1rem;">
+                        <div style="display: flex; gap: 1rem; align-items: center; flex-wrap: wrap;">
+                            <input type="text" class="input" id="base-url-input" placeholder="输入服务基础URL，如: http://localhost:3000" style="flex: 1; min-width: 250px;">
+                            <button class="btn btn-secondary" id="show-usage-btn">📖 使用说明</button>
+                        </div>
+                    </div>
+                    <div class="card table-container"><table><thead><tr><th>名称</th><th>Key值</th><th>绑定上游</th><th>状态</th><th>操作</th></tr></thead><tbody>
+                `;
+
+                cachedKeys.forEach((k, idx) => {
+                    const badge = k.enabled ? '<span class="badge badge-success">启用</span>' : '<span class="badge badge-danger">禁用</span>';
+                    html += `
+                        <tr>
+                            <td><strong>${escapeHtml(k.name || '未命名')}</strong></td>
+                            <td><code class="text-sm text-muted">${escapeHtml(k.key)}</code></td>
+                            <td>${escapeHtml(k.upstream_name || k.upstream_id?.substring(0,8) || '-')}</td>
+                            <td>${badge}</td>
+                            <td>
+                                <div class="flex gap-2">
+                                    <button class="btn btn-primary btn-sm" data-copy-key="${k.key}" title="复制订阅链接">📋 复制链接</button>
+                                    <button class="btn btn-primary btn-sm" data-key-idx="${idx}">编辑</button>
+                                    <button class="btn btn-danger btn-sm" data-key-del="${k.id}">删除</button>
+                                </div>
+                            </td>
+                        </tr>
+                    `;
+                });
+
+                html += '</tbody></table></div>';
+                content.innerHTML = html;
+
+                content.querySelectorAll('[data-key-idx]').forEach(btn => {
+                    btn.onclick = () => {
+                        const idx = parseInt(btn.dataset.keyIdx);
+                        openKeyModal(cachedKeys[idx]);
+                    };
+                });
+                content.querySelectorAll('[data-key-del]').forEach(btn => {
+                    btn.onclick = () => deleteKey(btn.dataset.keyDel);
+                });
+                content.querySelectorAll('[data-copy-key]').forEach(btn => {
+                    btn.onclick = () => copySubscribeLink(btn.dataset.copyKey);
+                });
+
+                // 绑定使用说明按钮
+                const showUsageBtn = $('#show-usage-btn');
+                if (showUsageBtn) {
+                    showUsageBtn.onclick = () => showHelpModal();
+                }
+            } catch (e) {
+                content.innerHTML = '<div class="text-danger">加载失败: ' + escapeHtml(e.message) + '</div>';
+            }
+        }
+
+        async function deleteKey(id) {
+            if (!confirm('确定删除此Key？')) return;
+            try {
+                await api('/keys/' + id, { method: 'DELETE' });
+                showToast('已删除', 'success');
+                renderKeys();
+            } catch (e) {
+                showToast(e.message, 'error');
+            }
+        }
+
+        function openKeyModal(data = null) {
+            const isEdit = !!data;
+            let optionsHtml = '<option value="">-- 请选择 --</option>';
+            cachedUpstreams.forEach(u => {
+                optionsHtml += `<option value="${u.id}" ${data?.upstream_id === u.id ? 'selected' : ''}>${escapeHtml(u.name)}</option>`;
+            });
+
+            const html = `
+                <div class="form-group">
+                    <label class="form-label">Key *</label>
+                    <input type="text" class="input" id="key-token" value="${escapeHtml(data?.key || '')}" ${isEdit ? 'disabled' : ''} placeholder="留空自动生成">
+                    ${isEdit ? '<div class="form-hint">Key创建后不可修改</div>' : ''}
+                </div>
+                <div class="form-group">
+                    <label class="form-label">名称/备注</label>
+                    <input type="text" class="input" id="key-name" value="${escapeHtml(data?.name || '')}">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">绑定上游 *</label>
+                    <select class="input" id="key-upstream">${optionsHtml}</select>
+                </div>
+                <div class="form-group">
+                    <label><input type="checkbox" id="key-enabled" ${!data || data.enabled ? 'checked' : ''}> 启用</label>
+                </div>
+            `;
+
+            showModal(isEdit ? '编辑Key' : '添加Key', html, async () => {
+                const payload = {
+                    name: $('#key-name').value.trim(),
+                    upstream_id: $('#key-upstream').value,
+                    enabled: $('#key-enabled').checked
+                };
+
+                if (!isEdit) {
+                    payload.key = $('#key-token').value.trim() || generateKey();
+                }
+
+                if (!payload.upstream_id) throw new Error('请选择上游');
+
+                const url = isEdit ? '/keys/' + data.id : '/keys';
+                const method = isEdit ? 'PUT' : 'POST';
+                await api(url, { method, body: JSON.stringify(payload) });
+                showToast('保存成功', 'success');
+                renderKeys();
+                return true;
+            });
+        }
+
+        function generateKey() {
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+            let result = '';
+            for (let i = 0; i < 16; i++) {
+                result += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+            return result;
+        }
+
+        function getBaseUrl() {
+            // 优先使用用户输入的URL，否则使用当前页面URL
+            const input = $('#base-url-input');
+            if (input && input.value.trim()) {
+                return input.value.trim().replace(/\/$/, '');
+            }
+            // 使用当前页面的 origin
+            return window.location.origin;
+        }
+
+        async function copySubscribeLink(key) {
+            const baseUrl = getBaseUrl();
+            const link = `${baseUrl}/apix/getSubscribe?token=${key}`;
+
+            try {
+                await navigator.clipboard.writeText(link);
+                showToast('订阅链接已复制到剪贴板', 'success');
+            } catch (err) {
+                // 降级方案：创建临时textarea
+                const textarea = document.createElement('textarea');
+                textarea.value = link;
+                textarea.style.position = 'fixed';
+                textarea.style.left = '-9999px';
+                document.body.appendChild(textarea);
+                textarea.select();
+                try {
+                    document.execCommand('copy');
+                    showToast('订阅链接已复制到剪贴板', 'success');
+                } catch (e) {
+                    showToast('复制失败，请手动复制: ' + link, 'error');
+                }
+                document.body.removeChild(textarea);
+            }
+        }
+
+        function showHelpModal() {
+            const baseUrl = getBaseUrl();
+            const html = `
+                <div class="form-group">
+                    <h3 style="margin-bottom: 1rem; color: var(--primary);">📖 使用方法</h3>
+
+                    <div style="margin-bottom: 1.5rem;">
+                        <h4 style="font-size: 1rem; margin-bottom: 0.5rem;">1. 获取订阅链接</h4>
+                        <p class="text-sm text-muted" style="margin-bottom: 0.5rem;">
+                            在 Key 管理页面，点击对应 Key 的「📋 复制链接」按钮，即可复制完整的订阅链接。
+                        </p>
+                    </div>
+
+                    <div style="margin-bottom: 1.5rem;">
+                        <h4 style="font-size: 1rem; margin-bottom: 0.5rem;">2. 在客户端中使用</h4>
+                        <p class="text-sm text-muted" style="margin-bottom: 0.5rem;">
+                            将复制的订阅链接粘贴到以下任一客户端的订阅设置中：
+                        </p>
+                        <ul class="text-sm" style="margin-left: 1.5rem; color: var(--text-muted);">
+                            <li>Clash / Clash Verge / Clash Meta</li>
+                            <li>Shadowrocket (小火箭)</li>
+                            <li>Quantumult X</li>
+                            <li>Surfboard</li>
+                            <li>V2Ray / V2RayNG / V2RayN</li>
+                            <li>Surge</li>
+                            <li>其他支持标准订阅链接的客户端</li>
+                        </ul>
+                    </div>
+
+                    <div style="margin-bottom: 1.5rem;">
+                        <h4 style="font-size: 1rem; margin-bottom: 0.5rem;">3. 订阅链接格式</h4>
+                        <div style="background: var(--bg-body); padding: 1rem; border-radius: var(--radius); font-family: monospace; font-size: 0.85rem; word-break: break-all;">
+                            ${baseUrl}/apix/getSubscribe?token=<span style="color: var(--primary);">YOUR_KEY</span>
+                        </div>
+                    </div>
+
+                    <div style="margin-bottom: 1rem;">
+                        <h4 style="font-size: 1rem; margin-bottom: 0.5rem;">4. 注意事项</h4>
+                        <ul class="text-sm" style="margin-left: 1.5rem; color: var(--text-muted);">
+                            <li>请妥善保管您的订阅链接，避免泄露给他人</li>
+                            <li>如果怀疑链接泄露，请及时更换 Key</li>
+                            <li>上游缓存会定期自动刷新，无需手动更新订阅</li>
+                            <li>每个 Key 绑定一个上游，可以在 Key 管理中查看</li>
+                        </ul>
+                    </div>
+                </div>
+            `;
+
+            showModal('使用说明', html, async () => true);
+        }
+
+        function initCustomHeadersList(headers) {
+            const container = $('#custom-headers-list');
+            if (!container) return;
+            
+            container.innerHTML = '';
+            
+            // Add existing headers
+            if (headers && typeof headers === 'object') {
+                Object.entries(headers).forEach(([key, value]) => {
+                    addHeaderRow(key, value);
+                });
+            }
+            
+            // Bind add button
+            const addBtn = $('#add-header-btn');
+            if (addBtn) {
+                addBtn.onclick = () => addHeaderRow('', '');
+            }
+        }
+
+        function addHeaderRow(key = '', value = '') {
+            const container = $('#custom-headers-list');
+            if (!container) return;
+            
+            const row = document.createElement('div');
+            row.className = 'header-row flex gap-2 mb-4';
+            row.style.alignItems = 'center';
+            row.innerHTML = `
+                <input type="text" class="input header-key" placeholder="Header名称" value="${escapeHtml(key)}" style="flex:1">
+                <input type="text" class="input header-value" placeholder="Header值" value="${escapeHtml(value)}" style="flex:2">
+                <button type="button" class="btn btn-danger btn-sm header-remove">&times;</button>
+            `;
+            
+            row.querySelector('.header-remove').onclick = () => row.remove();
+            container.appendChild(row);
+        }
+
+        async function renderLogs() {
+            const content = $('#content-area');
+            content.innerHTML = '<div class="text-muted">加载中...</div>';
+            await loadLogPage(1);
+        }
+
+        async function loadLogPage(page) {
+            state.logPage = page;
+            const content = $('#content-area');
+            
+            try {
+                const data = await api('/logs?page=' + page + '&page_size=50');
+                const logs = data.logs || [];
+                
+                let html = '<div class="card table-container"><table><thead><tr><th>时间</th><th>Key名称</th><th>IP</th><th>缓存</th><th>状态</th></tr></thead><tbody>';
+                
+                if (logs.length === 0) {
+                    html += '<tr><td colspan="5" class="text-muted" style="text-align:center">暂无日志</td></tr>';
+                } else {
+                    logs.forEach(l => {
+                        const cacheHit = l.cache_hit ? '<span class="badge badge-success">命中</span>' : '<span class="badge badge-warning">未命中</span>';
+                        const statusBadge = l.status === 'success' 
+                            ? '<span class="badge badge-success">成功</span>' 
+                            : '<span class="badge badge-danger">失败</span>';
+                        const keyDisplay = l.key_name || l.key || '-';
+                        html += `
+                            <tr>
+                                <td class="text-sm">${l.time ? new Date(l.time).toLocaleString() : '-'}</td>
+                                <td class="text-sm"><strong>${escapeHtml(keyDisplay)}</strong></td>
+                                <td class="text-sm">${escapeHtml(l.client_ip || '-')}</td>
+                                <td>${cacheHit}</td>
+                                <td>${statusBadge}</td>
+                            </tr>
+                        `;
+                    });
+                }
+
+                html += '</tbody></table></div>';
+
+                html += `
+                    <div class="pagination">
+                        <button class="btn btn-secondary btn-sm" onclick="loadLogPage(${page - 1})" ${page <= 1 ? 'disabled' : ''}>上一页</button>
+                        <span class="text-sm text-muted">第 ${data.page || 1} / ${data.total_pages || 1} 页 (共 ${data.total_count || 0} 条)</span>
+                        <button class="btn btn-secondary btn-sm" onclick="loadLogPage(${page + 1})" ${page >= (data.total_pages || 1) ? 'disabled' : ''}>下一页</button>
+                    </div>
+                `;
+
+                content.innerHTML = html;
+            } catch (e) {
+                content.innerHTML = '<div class="text-danger">加载失败: ' + escapeHtml(e.message) + '</div>';
+            }
+        }
+
+        async function renderSettings() {
+            const content = $('#content-area');
+            content.innerHTML = '<div class="text-muted">加载中...</div>';
+
+            try {
+                const data = await api('/settings');
+                const config = data.global_config || {};
+
+                content.innerHTML = `
+                    <div class="card">
+                        <div class="card-title">日志设置</div>
+                        <div class="form-group">
+                            <label class="form-label">日志保留天数</label>
+                            <input type="number" class="input" id="setting-retention" value="${config.log_retention_days || 0}" min="0" style="max-width: 200px;">
+                            <div class="form-hint">设置为0表示不自动清理。超过此天数的日志将在新日志写入时自动清理。</div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">活跃UA窗口（天）</label>
+                            <input type="number" class="input" id="setting-active-ua-days" value="${config.active_ua_days || 30}" min="1" style="max-width: 200px;">
+                            <div class="form-hint">强制缓存模式会刷新最近该天数内出现过的UA缓存变体。</div>
+                        </div>
+                        <button class="btn btn-primary" id="save-settings-btn">保存设置</button>
+                    </div>
+                `;
+
+                $('#save-settings-btn').onclick = async () => {
+                    try {
+                        const days = parseInt($('#setting-retention').value) || 0;
+                        const activeUaDays = parseInt($('#setting-active-ua-days').value) || 30;
+                        await api('/settings', { method: 'PUT', body: JSON.stringify({ log_retention_days: days, active_ua_days: activeUaDays }) });
+                        showToast('设置已保存', 'success');
+                    } catch (e) {
+                        showToast(e.message, 'error');
+                    }
+                };
+            } catch (e) {
+                content.innerHTML = '<div class="text-danger">加载失败: ' + escapeHtml(e.message) + '</div>';
+            }
+        }
+
+        function showModal(title, bodyHtml, onConfirm) {
+            const container = $('#modal-container');
+            container.innerHTML = `
+                <div class="modal-overlay" id="modal-overlay">
+                    <div class="modal">
+                        <div class="modal-header">
+                            <span>${escapeHtml(title)}</span>
+                            <button class="btn btn-secondary btn-sm" id="modal-close">&times;</button>
+                        </div>
+                        <div class="modal-body">${bodyHtml}</div>
+                        <div class="modal-footer">
+                            <button class="btn btn-secondary" id="modal-cancel">取消</button>
+                            <button class="btn btn-primary" id="modal-confirm">确定</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            const close = () => container.innerHTML = '';
+            $('#modal-close').onclick = close;
+            $('#modal-cancel').onclick = close;
+            $('#modal-overlay').onclick = (e) => { if (e.target.id === 'modal-overlay') close(); };
+
+            $('#modal-confirm').onclick = async () => {
+                const btn = $('#modal-confirm');
+                btn.disabled = true;
+                btn.textContent = '处理中...';
+                try {
+                    const result = await onConfirm();
+                    if (result) close();
+                } catch (e) {
+                    showToast(e.message, 'error');
+                } finally {
+                    if ($('#modal-confirm')) {
+                        btn.disabled = false;
+                        btn.textContent = '确定';
+                    }
+                }
+            };
+        }
+
+        function escapeHtml(str) {
+            if (!str) return '';
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+
+        async function login() {
+            const password = $('#login-password').value;
+            const errorEl = $('#login-error');
+            errorEl.textContent = '';
+
+            try {
+                await api('/login', { method: 'POST', body: JSON.stringify({ password }) });
+                showApp();
+            } catch (e) {
+                errorEl.textContent = e.message || '登录失败';
+            }
+        }
+
+        async function logout() {
+            try {
+                await api('/logout', { method: 'POST' });
+            } catch (e) {}
+            showLogin();
+        }
+
+        async function checkSession() {
+            try {
+                await api('/status');
+                showApp();
+            } catch (e) {
+                showLogin();
+            }
+        }
+
+        function init() {
+            $('#login-form').onsubmit = (e) => { e.preventDefault(); login(); };
+            $('#logout-btn').onclick = logout;
+
+            $$('.nav-item[data-view]').forEach(item => {
+                item.onclick = () => {
+                    navigate(item.dataset.view);
+                    if (window.innerWidth <= 768) {
+                        $('#sidebar').classList.remove('open');
+                    }
+                };
+            });
+
+            const menuBtn = $('#menu-toggle');
+            if (window.innerWidth <= 768) menuBtn.style.display = 'block';
+            menuBtn.onclick = () => $('#sidebar').classList.toggle('open');
+
+            checkSession();
+        }
+
+        init();
+    </script>
 </body>
 </html>

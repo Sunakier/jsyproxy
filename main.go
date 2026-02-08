@@ -42,12 +42,23 @@ func main() {
 	{
 		adminAPI.POST("/logout", subscribeHandler.AdminLogout)
 		adminAPI.GET("/status", subscribeHandler.AdminStatus)
+		adminAPI.GET("/cache-status", subscribeHandler.AdminCacheStatus)
 		adminAPI.GET("/settings", subscribeHandler.AdminGetSettings)
 		adminAPI.PUT("/settings", subscribeHandler.AdminUpdateSettings)
 		adminAPI.POST("/refresh", subscribeHandler.AdminManualRefresh)
+
+		adminAPI.GET("/upstreams", subscribeHandler.AdminListUpstreams)
+		adminAPI.POST("/upstreams", subscribeHandler.AdminAddUpstream)
+		adminAPI.PUT("/upstreams/:id", subscribeHandler.AdminUpdateUpstream)
+		adminAPI.DELETE("/upstreams/:id", subscribeHandler.AdminDeleteUpstream)
+		adminAPI.POST("/upstreams/:id/refresh", subscribeHandler.AdminRefreshUpstream)
+		adminAPI.POST("/upstreams/:id/dedupe", subscribeHandler.AdminDedupeUpstreamCache)
+
 		adminAPI.GET("/keys", subscribeHandler.AdminListKeys)
 		adminAPI.POST("/keys", subscribeHandler.AdminAddKey)
-		adminAPI.DELETE("/keys/:key", subscribeHandler.AdminDeleteKey)
+		adminAPI.PUT("/keys/:id", subscribeHandler.AdminUpdateKey)
+		adminAPI.DELETE("/keys/:id", subscribeHandler.AdminDeleteKey)
+
 		adminAPI.GET("/logs", subscribeHandler.AdminGetLogs)
 	}
 
