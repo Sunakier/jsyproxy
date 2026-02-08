@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"io"
 	"jsyproxy/config"
+	staticfiles "jsyproxy/static"
 	"jsyproxy/store"
 	"jsyproxy/utils"
 	"log"
@@ -337,7 +338,7 @@ func makeRefreshLockKey(upstreamID, userAgent string) string {
 }
 
 func (h *SubscribeHandler) AdminPage(c *gin.Context) {
-	c.File("./static/admin.html")
+	c.Data(http.StatusOK, "text/html; charset=utf-8", staticfiles.AdminHTML)
 }
 
 func (h *SubscribeHandler) AdminLogin(c *gin.Context) {
