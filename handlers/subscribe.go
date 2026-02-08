@@ -18,6 +18,15 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+var passthroughHeaderWhitelist = map[string]struct{}{
+	"subscription-userinfo":     {},
+	"profile-web-page-url":      {},
+	"profile-update-interval":   {},
+	"content-disposition":       {},
+	"content-type":              {},
+	"content-transfer-encoding": {},
+}
+
 type SubscribeResponse struct {
 	Data struct {
 		ExpiredAt      int64 `json:"expired_at"`
@@ -295,6 +304,7 @@ func (h *SubscribeHandler) RefreshUpstreamCache(upstreamID, reason, downstreamUA
 	for k, values := range contentResp.Header {
 		headersCopy[k] = append([]string(nil), values...)
 	}
+	mergeAllowedPassthroughHeaders(headersCopy, resp.Header)
 
 	h.state.SetCache(upstreamID, cacheVariantUA, &store.CachedSubscription{
 		Body:       body,
@@ -412,6 +422,7 @@ func (h *SubscribeHandler) AdminCacheStatus(c *gin.Context) {
 	upstreamStatuses := make([]gin.H, 0, len(upstreams))
 	for _, u := range upstreams {
 		uaStats := h.state.GetUpstreamUACacheStatuses(u.ID)
+		latestCache, hasCache := h.state.GetLatestCache(u.ID)
 		items := make([]gin.H, 0, len(uaStats))
 		for _, item := range uaStats {
 			displayUA := item.UserAgent
@@ -436,14 +447,21 @@ func (h *SubscribeHandler) AdminCacheStatus(c *gin.Context) {
 			items = append(items, entry)
 		}
 
-		upstreamStatuses = append(upstreamStatuses, gin.H{
+		entry := gin.H{
 			"id":                u.ID,
 			"name":              u.Name,
+			"enabled":           u.Enabled,
 			"cache_strategy":    u.CacheStrategy,
 			"refresh_interval":  u.RefreshInterval,
+			"has_cache":         hasCache,
+			"cache_variants":    h.state.CacheVariantCount(u.ID),
 			"ua_count":          len(items),
 			"ua_cache_statuses": items,
-		})
+		}
+		if hasCache {
+			entry["cache_updated_at"] = latestCache.UpdatedAt.Format(time.RFC3339)
+		}
+		upstreamStatuses = append(upstreamStatuses, entry)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"upstreams": upstreamStatuses})
@@ -700,6 +718,21 @@ func copyHeaders(src map[string][]string, dst http.Header) {
 		for _, value := range values {
 			dst.Add(key, value)
 		}
+	}
+}
+
+func mergeAllowedPassthroughHeaders(dst map[string][]string, src http.Header) {
+	for key, values := range src {
+		if _, ok := passthroughHeaderWhitelist[strings.ToLower(strings.TrimSpace(key))]; !ok {
+			continue
+		}
+		if len(values) == 0 {
+			continue
+		}
+		if _, exists := dst[key]; exists {
+			continue
+		}
+		dst[key] = append([]string(nil), values...)
 	}
 }
 

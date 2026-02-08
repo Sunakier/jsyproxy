@@ -149,6 +149,7 @@
                 <div class="sidebar-title">JsyProxy</div>
                 <nav id="nav-menu">
                     <div class="nav-item active" data-view="dashboard">概览</div>
+                    <div class="nav-item" data-view="cache">缓存状态</div>
                     <div class="nav-item" data-view="upstreams">上游管理</div>
                     <div class="nav-item" data-view="keys">Key管理</div>
                     <div class="nav-item" data-view="logs">访问日志</div>
@@ -223,11 +224,12 @@
             });
             $('#header-actions').innerHTML = '';
             
-            const titles = { dashboard: '概览', upstreams: '上游管理', keys: 'Key管理', logs: '访问日志', settings: '全局设置' };
+            const titles = { dashboard: '概览', cache: '缓存状态', upstreams: '上游管理', keys: 'Key管理', logs: '访问日志', settings: '全局设置' };
             $('#page-title').textContent = titles[view] || view;
 
             switch(view) {
                 case 'dashboard': renderDashboard(); break;
+                case 'cache': renderCache(); break;
                 case 'upstreams': renderUpstreams(); break;
                 case 'keys': renderKeys(); break;
                 case 'logs': renderLogs(); break;
@@ -240,14 +242,7 @@
             content.innerHTML = '<div class="text-muted">加载中...</div>';
             
             try {
-                const [data, cacheStatusData] = await Promise.all([
-                    api('/status'),
-                    api('/cache-status')
-                ]);
-                const cacheStatusMap = {};
-                (cacheStatusData.upstreams || []).forEach(u => {
-                    cacheStatusMap[u.id] = u;
-                });
+                const data = await api('/status');
                 
                 let html = `
                     <div class="stats-grid">
@@ -263,37 +258,120 @@
                             <div class="stat-value">${data.log_count || 0}</div>
                             <div class="stat-label">日志条数</div>
                         </div>
+                        <div class="card stat-card">
+                            <div class="stat-value">${data.global_config?.active_ua_days || 30}</div>
+                            <div class="stat-label">活跃UA窗口(天)</div>
+                        </div>
                     </div>
-                    <h3 class="mb-4">上游状态</h3>
-                    <div class="upstream-grid">
                 `;
+
+                html += '<h3 class="mb-4">上游运行状态</h3><div class="upstream-grid">';
 
                 if (data.upstreams && data.upstreams.length > 0) {
                     data.upstreams.forEach(u => {
                         const strategyText = u.cache_strategy === 'force' ? '强制缓存' : '懒缓存';
-                        const statusBadge = u.enabled 
-                            ? '<span class="badge badge-success">启用</span>' 
+                        const statusBadge = u.enabled
+                            ? '<span class="badge badge-success">启用</span>'
                             : '<span class="badge badge-danger">禁用</span>';
-                        
-                        let trafficHtml = '';
+                        const configuredBadge = u.configured
+                            ? '<span class="badge badge-info">已配置</span>'
+                            : '<span class="badge badge-warning">未配置</span>';
+
+                        let trafficHtml = '<div class="upstream-traffic"><div class="text-sm text-muted">暂无流量信息</div></div>';
                         if (u.traffic) {
                             trafficHtml = `
                                 <div class="upstream-traffic">
                                     <div><strong>${escapeHtml(u.traffic.plan_name || '未知套餐')}</strong></div>
-                                    <div class="text-sm text-muted">${escapeHtml(u.traffic.usage_text || '-')}</div>
-                                    <div class="text-sm text-muted">${escapeHtml(u.traffic.expiry_text || '-')}</div>
+                                    <div class="text-sm text-muted">总览: ${escapeHtml(u.traffic.usage_text || '-')}</div>
+                                    <div class="text-sm text-muted">到期/重置: ${escapeHtml(u.traffic.expiry_text || '-')}</div>
+                                    <div class="text-sm text-muted">上行: ${escapeHtml(String(u.traffic.used_upload ?? '-'))}</div>
+                                    <div class="text-sm text-muted">下行: ${escapeHtml(String(u.traffic.used_download ?? '-'))}</div>
+                                    <div class="text-sm text-muted">总额度: ${escapeHtml(String(u.traffic.transfer_enable ?? '-'))}</div>
+                                    ${u.traffic.subscribe_source ? '<div class="text-sm text-muted">订阅源: ' + escapeHtml(u.traffic.subscribe_source) + '</div>' : ''}
                                 </div>
                             `;
                         }
 
-                        const uaRows = (cacheStatusMap[u.id]?.ua_cache_statuses || []).map(item => {
+                        html += `
+                            <div class="card">
+                                <div class="upstream-header">
+                                    <span class="upstream-name">${escapeHtml(u.name || '未命名')}</span>
+                                    <div class="flex gap-2">${statusBadge}${configuredBadge}</div>
+                                </div>
+                                <div class="upstream-detail">
+                                    <div>策略: ${strategyText}</div>
+                                    <div>刷新周期: ${escapeHtml(u.refresh_interval || '10m')}</div>
+                                    <div>缓存状态: ${u.has_cache ? '有效' : '无缓存'}</div>
+                                    <div>缓存变体数: ${u.cache_variants || 0}</div>
+                                    ${u.cache_updated_at ? '<div>缓存更新时间: ' + new Date(u.cache_updated_at).toLocaleString() + '</div>' : ''}
+                                </div>
+                                ${trafficHtml}
+                            </div>
+                        `;
+                    });
+                } else {
+                    html += '<div class="card text-muted">暂无上游配置，请先添加上游</div>';
+                }
+
+                html += '</div>';
+
+                content.innerHTML = html;
+            } catch (e) {
+                content.innerHTML = '<div class="text-danger">加载失败: ' + escapeHtml(e.message) + '</div>';
+            }
+        }
+
+        async function renderCache() {
+            const content = $('#content-area');
+            content.innerHTML = '<div class="text-muted">加载中...</div>';
+            
+            try {
+                const cacheData = await api('/cache-status');
+                
+                let html = `
+                    <div class="flex justify-between items-center mb-4">
+                        <h3>上游缓存详情</h3>
+                        <button class="btn btn-secondary btn-sm" onclick="renderCache()">↻ 刷新</button>
+                    </div>
+                    <div class="upstream-grid">
+                `;
+
+                if (cacheData.upstreams && cacheData.upstreams.length > 0) {
+                    cacheData.upstreams.forEach(u => {
+                        const strategyText = u.cache_strategy === 'force' ? '强制缓存' : '懒缓存';
+                        const statusBadge = u.enabled 
+                            ? '<span class="badge badge-success">启用</span>' 
+                            : '<span class="badge badge-danger">禁用</span>';
+
+                        const uaRows = (u.ua_cache_statuses || []).map(item => {
                             const uaText = item.is_default ? '默认UA' : (item.user_agent || '-');
                             const uaDisplay = item.is_default
                                 ? '<span class="badge badge-info">默认UA</span>'
                                 : `<span title="${escapeHtml(uaText)}">${escapeHtml(uaText.length > 48 ? uaText.slice(0, 48) + '...' : uaText)}</span>`;
+                            
+                            const hasCacheBadge = item.has_cache 
+                                ? '<span class="badge badge-success">已缓存</span>' 
+                                : '<span class="badge badge-warning">未缓存</span>';
+                                
+                            const updatedTime = item.cache_updated_at 
+                                ? new Date(item.cache_updated_at).toLocaleString() 
+                                : '-';
+                            const lastSeenTime = item.last_seen_at
+                                ? new Date(item.last_seen_at).toLocaleString()
+                                : '-';
+                                
                             return `
                                 <tr>
-                                    <td>${uaDisplay}</td>
+                                    <td>
+                                        <div>${uaDisplay}</div>
+                                        <div class="text-sm text-muted" style="font-size: 0.75rem; margin-top: 2px;">
+                                            更新于: ${updatedTime}
+                                        </div>
+                                        <div class="text-sm text-muted" style="font-size: 0.75rem; margin-top: 2px;">
+                                            最近请求: ${lastSeenTime}
+                                        </div>
+                                    </td>
+                                    <td>${hasCacheBadge}</td>
                                     <td>${item.total_requests || 0}</td>
                                     <td>${item.today_requests || 0}</td>
                                     <td>${item.month_requests || 0}</td>
@@ -306,7 +384,7 @@
                                 <div class="ua-cache-table-wrap table-container">
                                     <table>
                                         <thead>
-                                            <tr><th>UA</th><th>总请求</th><th>今日</th><th>本月</th></tr>
+                                            <tr><th>UA / 更新时间</th><th>状态</th><th>总请求</th><th>今日</th><th>本月</th></tr>
                                         </thead>
                                         <tbody>${uaRows}</tbody>
                                     </table>
@@ -324,9 +402,9 @@
                                     <div>策略: ${strategyText}</div>
                                     <div>刷新周期: ${escapeHtml(u.refresh_interval || '10m')}</div>
                                     <div>缓存状态: ${u.has_cache ? '有效' : '无缓存'}</div>
+                                    <div>缓存变体数: ${u.cache_variants || 0}</div>
                                     ${u.cache_updated_at ? '<div>更新: ' + new Date(u.cache_updated_at).toLocaleString() + '</div>' : ''}
                                 </div>
-                                ${trafficHtml}
                                 ${uaTableHtml}
                             </div>
                         `;
@@ -365,23 +443,32 @@
                 
                 cachedUpstreamsList.forEach((u, idx) => {
                     const badge = u.enabled ? '<span class="badge badge-success">启用</span>' : '<span class="badge badge-danger">禁用</span>';
-                    const strategy = u.cache_strategy === 'force' ? '强制' : '懒加载';
-                    html += `
-                        <tr>
-                            <td><strong>${escapeHtml(u.name)}</strong><div class="text-sm text-muted">${escapeHtml(u.id.substring(0,8))}...</div></td>
-                            <td>${strategy}</td>
-                            <td>${escapeHtml(u.refresh_interval)}</td>
-                            <td>${badge}</td>
-                            <td>
-                                <div class="flex gap-2">
-                                    <button class="btn btn-secondary btn-sm" data-up-refresh="${u.id}">刷新</button>
-                                    <button class="btn btn-secondary btn-sm" data-up-dedupe="${u.id}">去重</button>
-                                    <button class="btn btn-primary btn-sm" data-up-idx="${idx}">编辑</button>
-                                    <button class="btn btn-danger btn-sm" data-up-del="${u.id}">删除</button>
-                                </div>
-                            </td>
-                        </tr>
-                    `;
+                        const strategy = u.cache_strategy === 'force' ? '强制' : '懒加载';
+                        const toggleStrategy = u.cache_strategy === 'force' ? 'lazy' : 'force';
+                        const toggleLabel = u.cache_strategy === 'force' ? '切换为懒缓存' : '切换为强制';
+                        
+                        html += `
+                            <tr>
+                                <td><strong>${escapeHtml(u.name)}</strong><div class="text-sm text-muted">${escapeHtml(u.id.substring(0,8))}...</div></td>
+                                <td>
+                                    ${strategy} 
+                                    <button class="btn btn-secondary btn-sm" style="font-size: 0.7rem; padding: 1px 4px; margin-left: 4px;" 
+                                        data-up-toggle-strategy="${u.id}" 
+                                        data-up-target-strategy="${toggleStrategy}"
+                                        title="${toggleLabel}">⇄</button>
+                                </td>
+                                <td>${escapeHtml(u.refresh_interval)}</td>
+                                <td>${badge}</td>
+                                <td>
+                                    <div class="flex gap-2">
+                                        <button class="btn btn-secondary btn-sm" data-up-refresh="${u.id}">刷新</button>
+                                        <button class="btn btn-secondary btn-sm" data-up-dedupe="${u.id}">去重</button>
+                                        <button class="btn btn-primary btn-sm" data-up-idx="${idx}">编辑</button>
+                                        <button class="btn btn-danger btn-sm" data-up-del="${u.id}">删除</button>
+                                    </div>
+                                </td>
+                            </tr>
+                        `;
                 });
 
                 html += '</tbody></table></div>';
@@ -392,6 +479,9 @@
                 });
                 content.querySelectorAll('[data-up-dedupe]').forEach(btn => {
                     btn.onclick = () => dedupeUpstreamCache(btn.dataset.upDedupe);
+                });
+                content.querySelectorAll('[data-up-toggle-strategy]').forEach(btn => {
+                    btn.onclick = () => switchCacheStrategy(btn.dataset.upToggleStrategy, btn.dataset.upTargetStrategy);
                 });
                 content.querySelectorAll('[data-up-idx]').forEach(btn => {
                     btn.onclick = () => {
@@ -404,6 +494,22 @@
                 });
             } catch (e) {
                 content.innerHTML = '<div class="text-danger">加载失败: ' + escapeHtml(e.message) + '</div>';
+            }
+        }
+
+        async function switchCacheStrategy(id, newStrategy) {
+            try {
+                // Find current upstream data to preserve other fields
+                const upstream = cachedUpstreamsList.find(u => u.id === id);
+                if (!upstream) throw new Error('上游未找到');
+                
+                const payload = { ...upstream, cache_strategy: newStrategy };
+                
+                await api('/upstreams/' + id, { method: 'PUT', body: JSON.stringify(payload) });
+                showToast(`策略已切换为 ${newStrategy === 'force' ? '强制缓存' : '懒缓存'}`, 'success');
+                renderUpstreams();
+            } catch (e) {
+                showToast(e.message, 'error');
             }
         }
 
@@ -917,7 +1023,9 @@
                 </div>
             `;
 
-            const close = () => container.innerHTML = '';
+            const close = () => {
+                container.innerHTML = '';
+            };
             $('#modal-close').onclick = close;
             $('#modal-cancel').onclick = close;
             $('#modal-overlay').onclick = (e) => { if (e.target.id === 'modal-overlay') close(); };
