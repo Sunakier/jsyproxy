@@ -387,9 +387,9 @@ func (h *SubscribeHandler) AdminStatus(c *gin.Context) {
 
 		if hasCache {
 			used := cache.TrafficStatus.UsedUpload + cache.TrafficStatus.UsedDownload
-			daysUntilReset := 0
-			if cache.TrafficStatus.ResetDay > 0 {
-				daysUntilReset = calculateDaysUntilReset(cache.TrafficStatus.ResetDay)
+			daysUntilReset := cache.TrafficStatus.ResetDay
+			if daysUntilReset < 0 {
+				daysUntilReset = 0
 			}
 			status["cache_updated_at"] = cache.UpdatedAt.Format(time.RFC3339)
 			status["traffic"] = gin.H{
@@ -755,53 +755,19 @@ func formatBytes(v int64) string {
 }
 
 func formatExpiry(expiredAt int64, resetDay int) string {
+	if resetDay < 0 {
+		resetDay = 0
+	}
+
 	if expiredAt <= 0 {
 		if resetDay > 0 {
-			daysUntilReset := calculateDaysUntilReset(resetDay)
-			return fmt.Sprintf("下次重置: %d天后 (每月%d号)", daysUntilReset, resetDay)
+			return fmt.Sprintf("下次重置: %d天后", resetDay)
 		}
 		return "未提供到期信息"
 	}
 	t := time.Unix(expiredAt, 0)
 	if resetDay > 0 {
-		daysUntilReset := calculateDaysUntilReset(resetDay)
-		return fmt.Sprintf("到期: %s / 下次重置: %d天后 (每月%d号)", t.Format("2006-01-02 15:04:05"), daysUntilReset, resetDay)
+		return fmt.Sprintf("到期: %s / 下次重置: %d天后", t.Format("2006-01-02 15:04:05"), resetDay)
 	}
 	return "到期: " + t.Format("2006-01-02 15:04:05")
-}
-
-func calculateDaysUntilReset(resetDay int) int {
-	now := time.Now()
-	currentDay := now.Day()
-	currentYear := now.Year()
-	currentMonth := now.Month()
-
-	var nextReset time.Time
-	if currentDay < resetDay {
-		nextReset = time.Date(currentYear, currentMonth, resetDay, 0, 0, 0, 0, now.Location())
-	} else {
-		nextMonth := currentMonth + 1
-		nextYear := currentYear
-		if nextMonth > 12 {
-			nextMonth = 1
-			nextYear++
-		}
-		daysInNextMonth := daysInMonth(nextYear, nextMonth)
-		targetDay := resetDay
-		if targetDay > daysInNextMonth {
-			targetDay = daysInNextMonth
-		}
-		nextReset = time.Date(nextYear, nextMonth, targetDay, 0, 0, 0, 0, now.Location())
-	}
-
-	duration := nextReset.Sub(time.Date(currentYear, currentMonth, currentDay, 0, 0, 0, 0, now.Location()))
-	days := int(duration.Hours() / 24)
-	if days < 0 {
-		days = 0
-	}
-	return days
-}
-
-func daysInMonth(year int, month time.Month) int {
-	return time.Date(year, month+1, 0, 0, 0, 0, 0, time.UTC).Day()
 }
