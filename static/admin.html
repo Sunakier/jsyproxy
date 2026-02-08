@@ -127,6 +127,165 @@
             .main-content { margin-left: 0; }
             .menu-toggle { display: block !important; }
         }
+
+        /* Dashboard Card Styles */
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+            gap: 1.5rem;
+            margin-top: 1rem;
+        }
+
+        .dash-card {
+            background: var(--bg-card);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            box-shadow: var(--shadow);
+            transition: all 0.3s ease;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .dash-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+            border-color: var(--primary);
+        }
+
+        .dash-card-header {
+            padding: 1.25rem;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: linear-gradient(to right, rgba(59, 130, 246, 0.02), transparent);
+        }
+
+        .dash-card-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--text-main);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .dash-card-status {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .dash-card-body {
+            padding: 1.25rem;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .dash-info-group {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.9rem;
+        }
+
+        .dash-label { color: var(--text-muted); }
+        .dash-value { font-weight: 500; color: var(--text-main); }
+        .dash-value.sm { font-size: 0.85rem; }
+
+        .traffic-bar-container {
+            margin-top: 0.75rem;
+            margin-bottom: 0.75rem;
+            padding: 0.75rem;
+            background: var(--bg-body);
+            border-radius: var(--radius);
+        }
+        
+        .traffic-header {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.85rem;
+            font-weight: 500;
+            margin-bottom: 0.5rem;
+            color: var(--text-main);
+        }
+
+        .traffic-sub {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 0.25rem;
+        }
+
+        .traffic-bar-bg {
+            height: 8px;
+            background: rgba(0,0,0,0.05);
+            border-radius: 99px;
+            overflow: hidden;
+        }
+        :root[data-theme='dark'] .traffic-bar-bg { background: rgba(255,255,255,0.1); }
+
+        .traffic-bar-fill {
+            height: 100%;
+            background: var(--primary);
+            border-radius: 99px;
+            transition: width 0.5s ease;
+        }
+        .traffic-bar-fill.warning { background: var(--warning); }
+        .traffic-bar-fill.danger { background: var(--danger); }
+
+        .dash-card-footer {
+            padding: 0.75rem 1.25rem;
+            background: var(--bg-body);
+            border-top: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+        
+        .tag {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.125rem 0.6rem;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 500;
+            line-height: 1.4;
+        }
+        .tag-blue { background: rgba(59, 130, 246, 0.1); color: var(--primary); }
+        .tag-green { background: rgba(16, 185, 129, 0.1); color: var(--success); }
+        .tag-red { background: rgba(239, 68, 68, 0.1); color: var(--danger); }
+        .tag-gray { background: rgba(107, 114, 128, 0.1); color: var(--text-muted); }
+        .tag-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+        .bg-success { background-color: var(--success); }
+        .bg-danger { background-color: var(--danger); }
+        .bg-warning { background-color: var(--warning); }
+        .bg-info { background-color: var(--primary); }
+        .dash-actions {
+            display: flex;
+            gap: 0.5rem;
+            justify-content: flex-end;
+            width: 100%;
+            flex-wrap: wrap;
+        }
+        .code-box {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            background: var(--bg-body);
+            padding: 0.35rem 0.6rem;
+            border-radius: 4px;
+            font-size: 0.85rem;
+            word-break: break-all;
+            border: 1px solid var(--border);
+            color: var(--primary);
+        }
+        .dash-btn-group {
+            display: flex;
+            gap: 0.25rem;
+        }
     </style>
 </head>
 <body>
@@ -265,47 +424,103 @@
                     </div>
                 `;
 
-                html += '<h3 class="mb-4">上游运行状态</h3><div class="upstream-grid">';
+                html += '<h3 class="mb-4">上游运行状态</h3><div class="dashboard-grid">';
 
                 if (data.upstreams && data.upstreams.length > 0) {
                     data.upstreams.forEach(u => {
-                        const strategyText = u.cache_strategy === 'force' ? '强制缓存' : '懒缓存';
+                        // Status & Configured Badges
                         const statusBadge = u.enabled
-                            ? '<span class="badge badge-success">启用</span>'
-                            : '<span class="badge badge-danger">禁用</span>';
+                            ? '<span class="tag tag-green"><span class="tag-dot bg-success"></span>启用</span>'
+                            : '<span class="tag tag-red"><span class="tag-dot bg-danger"></span>禁用</span>';
+                        
                         const configuredBadge = u.configured
-                            ? '<span class="badge badge-info">已配置</span>'
-                            : '<span class="badge badge-warning">未配置</span>';
+                            ? '<span class="tag tag-blue"><span class="tag-dot bg-info"></span>已配置</span>'
+                            : '<span class="tag tag-gray"><span class="tag-dot bg-warning"></span>未配置</span>';
 
-                        let trafficHtml = '<div class="upstream-traffic"><div class="text-sm text-muted">暂无流量信息</div></div>';
+                        // Traffic Logic
+                        let trafficSection = '';
+                        let updatedTime = u.cache_updated_at 
+                            ? new Date(u.cache_updated_at).toLocaleString() 
+                            : '从未更新';
+
                         if (u.traffic) {
-                            trafficHtml = `
-                                <div class="upstream-traffic">
-                                    <div><strong>${escapeHtml(u.traffic.plan_name || '未知套餐')}</strong></div>
-                                    <div class="text-sm text-muted">总览: ${escapeHtml(u.traffic.usage_text || '-')}</div>
-                                    <div class="text-sm text-muted">到期/重置: ${escapeHtml(u.traffic.expiry_text || '-')}</div>
-                                    <div class="text-sm text-muted">上行: ${escapeHtml(String(u.traffic.used_upload ?? '-'))}</div>
-                                    <div class="text-sm text-muted">下行: ${escapeHtml(String(u.traffic.used_download ?? '-'))}</div>
-                                    <div class="text-sm text-muted">总额度: ${escapeHtml(String(u.traffic.transfer_enable ?? '-'))}</div>
-                                    ${u.traffic.subscribe_source ? '<div class="text-sm text-muted">订阅源: ' + escapeHtml(u.traffic.subscribe_source) + '</div>' : ''}
+                            // Try to calculate percentage
+                            const usedUp = parseFloat(u.traffic.used_upload) || 0;
+                            const usedDown = parseFloat(u.traffic.used_download) || 0;
+                            const total = parseFloat(u.traffic.transfer_enable) || 0;
+                            const used = usedUp + usedDown;
+                            
+                            let pct = 0;
+                            if (total > 0) {
+                                pct = (used / total) * 100;
+                                if (pct > 100) pct = 100;
+                            }
+
+                            // Progress Bar Color
+                            let barClass = '';
+                            if (pct >= 90) barClass = 'danger';
+                            else if (pct >= 80) barClass = 'warning';
+
+                            // Text Display
+                            const usageText = u.traffic.usage_text || `${(used/1073741824).toFixed(2)}GB / ${(total/1073741824).toFixed(2)}GB`;
+                            const expiryText = u.traffic.expiry_text || '长期有效';
+
+                            trafficSection = `
+                                <div class="traffic-bar-container">
+                                    <div class="traffic-header">
+                                        <span>${escapeHtml(u.traffic.plan_name || '套餐信息')}</span>
+                                        <span>${pct.toFixed(1)}%</span>
+                                    </div>
+                                    <div class="traffic-bar-bg">
+                                        <div class="traffic-bar-fill ${barClass}" style="width: ${pct}%"></div>
+                                    </div>
+                                    <div class="traffic-sub" style="display:flex; justify-content:space-between;">
+                                        <span>${escapeHtml(usageText)}</span>
+                                        <span>${escapeHtml(expiryText)}</span>
+                                    </div>
+                                </div>
+                            `;
+                        } else {
+                             trafficSection = `
+                                <div class="traffic-bar-container" style="display:flex; justify-content:center; align-items:center; min-height: 80px; color: var(--text-muted); background: var(--bg-body);">
+                                    <span style="font-size:0.85rem">暂无流量数据</span>
                                 </div>
                             `;
                         }
 
                         html += `
-                            <div class="card">
-                                <div class="upstream-header">
-                                    <span class="upstream-name">${escapeHtml(u.name || '未命名')}</span>
-                                    <div class="flex gap-2">${statusBadge}${configuredBadge}</div>
+                            <div class="dash-card">
+                                <div class="dash-card-header">
+                                    <div class="dash-card-title">
+                                        ${escapeHtml(u.name || '未命名')}
+                                    </div>
+                                    <div class="dash-card-status">
+                                        ${statusBadge}
+                                        ${configuredBadge}
+                                    </div>
                                 </div>
-                                <div class="upstream-detail">
-                                    <div>策略: ${strategyText}</div>
-                                    <div>刷新周期: ${escapeHtml(u.refresh_interval || '10m')}</div>
-                                    <div>缓存状态: ${u.has_cache ? '有效' : '无缓存'}</div>
-                                    <div>缓存变体数: ${u.cache_variants || 0}</div>
-                                    ${u.cache_updated_at ? '<div>缓存更新时间: ' + new Date(u.cache_updated_at).toLocaleString() + '</div>' : ''}
+                                <div class="dash-card-body">
+                                    <div class="dash-info-group">
+                                        <span class="dash-label">缓存策略</span>
+                                        <span class="dash-value sm">${u.cache_strategy === 'force' ? '强制' : '懒加载'}</span>
+                                    </div>
+                                    <div class="dash-info-group">
+                                        <span class="dash-label">刷新周期</span>
+                                        <span class="dash-value sm">${escapeHtml(u.refresh_interval || '10m')}</span>
+                                    </div>
+                                    <div class="dash-info-group">
+                                        <span class="dash-label">缓存状态</span>
+                                        <span class="dash-value sm">${u.has_cache ? '<span class="text-success">有效</span>' : '<span class="text-muted">无</span>'}</span>
+                                    </div>
+                                    <div class="dash-info-group">
+                                        <span class="dash-label">变体数量</span>
+                                        <span class="dash-value sm">${u.cache_variants || 0}</span>
+                                    </div>
+                                    ${trafficSection}
                                 </div>
-                                ${trafficHtml}
+                                <div class="dash-card-footer">
+                                    <span>更新于 ${updatedTime}</span>
+                                </div>
                             </div>
                         `;
                     });
@@ -333,25 +548,25 @@
                         <h3>上游缓存详情</h3>
                         <button class="btn btn-secondary btn-sm" onclick="renderCache()">↻ 刷新</button>
                     </div>
-                    <div class="upstream-grid">
+                    <div class="dashboard-grid">
                 `;
 
                 if (cacheData.upstreams && cacheData.upstreams.length > 0) {
                     cacheData.upstreams.forEach(u => {
                         const strategyText = u.cache_strategy === 'force' ? '强制缓存' : '懒缓存';
                         const statusBadge = u.enabled 
-                            ? '<span class="badge badge-success">启用</span>' 
-                            : '<span class="badge badge-danger">禁用</span>';
+                            ? '<span class="tag tag-green"><span class="tag-dot bg-success"></span>启用</span>'
+                            : '<span class="tag tag-red"><span class="tag-dot bg-danger"></span>禁用</span>';
 
                         const uaRows = (u.ua_cache_statuses || []).map(item => {
                             const uaText = item.is_default ? '默认UA' : (item.user_agent || '-');
                             const uaDisplay = item.is_default
-                                ? '<span class="badge badge-info">默认UA</span>'
+                                ? '<span class="tag tag-blue">默认UA</span>'
                                 : `<span title="${escapeHtml(uaText)}">${escapeHtml(uaText.length > 48 ? uaText.slice(0, 48) + '...' : uaText)}</span>`;
                             
                             const hasCacheBadge = item.has_cache 
-                                ? '<span class="badge badge-success">已缓存</span>' 
-                                : '<span class="badge badge-warning">未缓存</span>';
+                                ? '<span class="tag tag-green">已缓存</span>' 
+                                : '<span class="tag tag-gray">未缓存</span>';
                                 
                             const updatedTime = item.cache_updated_at 
                                 ? new Date(item.cache_updated_at).toLocaleString() 
@@ -365,26 +580,22 @@
                                     <td>
                                         <div>${uaDisplay}</div>
                                         <div class="text-sm text-muted" style="font-size: 0.75rem; margin-top: 2px;">
-                                            更新于: ${updatedTime}
-                                        </div>
-                                        <div class="text-sm text-muted" style="font-size: 0.75rem; margin-top: 2px;">
-                                            最近请求: ${lastSeenTime}
+                                            更新: ${updatedTime}
                                         </div>
                                     </td>
                                     <td>${hasCacheBadge}</td>
                                     <td>${item.total_requests || 0}</td>
-                                    <td>${item.today_requests || 0}</td>
-                                    <td>${item.month_requests || 0}</td>
                                 </tr>
                             `;
                         }).join('');
 
                         const uaTableHtml = uaRows
                             ? `
-                                <div class="ua-cache-table-wrap table-container">
-                                    <table>
+                                <div class="table-container" style="margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 0.5rem;">
+                                    <div style="font-size:0.85rem; font-weight:600; margin-bottom:0.5rem;">UA 变体列表</div>
+                                    <table style="font-size: 0.8rem;">
                                         <thead>
-                                            <tr><th>UA / 更新时间</th><th>状态</th><th>总请求</th><th>今日</th><th>本月</th></tr>
+                                            <tr><th>UA / 时间</th><th>状态</th><th>请求数</th></tr>
                                         </thead>
                                         <tbody>${uaRows}</tbody>
                                     </table>
@@ -393,24 +604,34 @@
                             : '<div class="text-sm text-muted mt-4">暂无UA缓存统计</div>';
 
                         html += `
-                            <div class="card">
-                                <div class="upstream-header">
-                                    <span class="upstream-name">${escapeHtml(u.name || '未命名')}</span>
+                            <div class="dash-card">
+                                <div class="dash-card-header">
+                                    <div class="dash-card-title">${escapeHtml(u.name || '未命名')}</div>
                                     ${statusBadge}
                                 </div>
-                                <div class="upstream-detail">
-                                    <div>策略: ${strategyText}</div>
-                                    <div>刷新周期: ${escapeHtml(u.refresh_interval || '10m')}</div>
-                                    <div>缓存状态: ${u.has_cache ? '有效' : '无缓存'}</div>
-                                    <div>缓存变体数: ${u.cache_variants || 0}</div>
-                                    ${u.cache_updated_at ? '<div>更新: ' + new Date(u.cache_updated_at).toLocaleString() + '</div>' : ''}
+                                <div class="dash-card-body">
+                                    <div class="dash-info-group">
+                                        <span class="dash-label">策略</span>
+                                        <span class="dash-value sm">${strategyText}</span>
+                                    </div>
+                                    <div class="dash-info-group">
+                                        <span class="dash-label">刷新周期</span>
+                                        <span class="dash-value sm">${escapeHtml(u.refresh_interval || '10m')}</span>
+                                    </div>
+                                    <div class="dash-info-group">
+                                        <span class="dash-label">变体数量</span>
+                                        <span class="dash-value sm">${u.cache_variants || 0}</span>
+                                    </div>
+                                    ${uaTableHtml}
                                 </div>
-                                ${uaTableHtml}
+                                <div class="dash-card-footer">
+                                    <span>更新于 ${u.cache_updated_at ? new Date(u.cache_updated_at).toLocaleString() : '从未更新'}</span>
+                                </div>
                             </div>
                         `;
                     });
                 } else {
-                    html += '<div class="card text-muted">暂无上游配置，请先添加上游</div>';
+                    html += '<div class="card text-muted">暂无上游配置</div>';
                 }
 
                 html += '</div>';
@@ -439,39 +660,59 @@
                     return;
                 }
 
-                let html = '<div class="card table-container"><table><thead><tr><th>名称</th><th>策略</th><th>刷新周期</th><th>状态</th><th>操作</th></tr></thead><tbody>';
+                let html = '<div class="dashboard-grid">';
                 
                 cachedUpstreamsList.forEach((u, idx) => {
-                    const badge = u.enabled ? '<span class="badge badge-success">启用</span>' : '<span class="badge badge-danger">禁用</span>';
-                        const strategy = u.cache_strategy === 'force' ? '强制' : '懒加载';
-                        const toggleStrategy = u.cache_strategy === 'force' ? 'lazy' : 'force';
-                        const toggleLabel = u.cache_strategy === 'force' ? '切换为懒缓存' : '切换为强制';
-                        
-                        html += `
-                            <tr>
-                                <td><strong>${escapeHtml(u.name)}</strong><div class="text-sm text-muted">${escapeHtml(u.id.substring(0,8))}...</div></td>
-                                <td>
-                                    ${strategy} 
-                                    <button class="btn btn-secondary btn-sm" style="font-size: 0.7rem; padding: 1px 4px; margin-left: 4px;" 
-                                        data-up-toggle-strategy="${u.id}" 
-                                        data-up-target-strategy="${toggleStrategy}"
-                                        title="${toggleLabel}">⇄</button>
-                                </td>
-                                <td>${escapeHtml(u.refresh_interval)}</td>
-                                <td>${badge}</td>
-                                <td>
-                                    <div class="flex gap-2">
-                                        <button class="btn btn-secondary btn-sm" data-up-refresh="${u.id}">刷新</button>
-                                        <button class="btn btn-secondary btn-sm" data-up-dedupe="${u.id}">去重</button>
-                                        <button class="btn btn-primary btn-sm" data-up-idx="${idx}">编辑</button>
-                                        <button class="btn btn-danger btn-sm" data-up-del="${u.id}">删除</button>
+                    const badge = u.enabled 
+                        ? '<span class="tag tag-green"><span class="tag-dot bg-success"></span>启用</span>' 
+                        : '<span class="tag tag-red"><span class="tag-dot bg-danger"></span>禁用</span>';
+                    const strategy = u.cache_strategy === 'force' ? '强制' : '懒加载';
+                    const toggleStrategy = u.cache_strategy === 'force' ? 'lazy' : 'force';
+                    const toggleLabel = u.cache_strategy === 'force' ? '切换为懒缓存' : '切换为强制';
+                    
+                    html += `
+                        <div class="dash-card">
+                            <div class="dash-card-header">
+                                <div class="dash-card-title">${escapeHtml(u.name || '未命名')}</div>
+                                ${badge}
+                            </div>
+                            <div class="dash-card-body">
+                                <div class="dash-info-group">
+                                    <span class="dash-label">API Endpoint</span>
+                                </div>
+                                <div class="code-box" style="margin-top: -0.5rem; margin-bottom: 0.5rem;">
+                                    ${escapeHtml(u.api_endpoint || '-')}
+                                </div>
+                                
+                                <div class="dash-info-group">
+                                    <span class="dash-label">策略</span>
+                                    <div class="dash-btn-group items-center">
+                                        <span class="dash-value sm">${strategy}</span>
+                                        <button class="btn btn-secondary btn-sm" style="font-size: 0.7rem; padding: 2px 6px;" 
+                                            data-up-toggle-strategy="${u.id}" 
+                                            data-up-target-strategy="${toggleStrategy}"
+                                            title="${toggleLabel}">⇄</button>
                                     </div>
-                                </td>
-                            </tr>
-                        `;
+                                </div>
+
+                                <div class="dash-info-group">
+                                    <span class="dash-label">刷新周期</span>
+                                    <span class="dash-value sm">${escapeHtml(u.refresh_interval || '10m')}</span>
+                                </div>
+                            </div>
+                            <div class="dash-card-footer">
+                                <div class="dash-actions">
+                                    <button class="btn btn-secondary btn-sm" data-up-refresh="${u.id}">刷新</button>
+                                    <button class="btn btn-secondary btn-sm" data-up-dedupe="${u.id}">去重</button>
+                                    <button class="btn btn-primary btn-sm" data-up-idx="${idx}">✎</button>
+                                    <button class="btn btn-danger btn-sm" data-up-del="${u.id}">🗑️</button>
+                                </div>
+                            </div>
+                        </div>
+                    `;
                 });
 
-                html += '</tbody></table></div>';
+                html += '</div>';
                 content.innerHTML = html;
 
                 content.querySelectorAll('[data-up-refresh]').forEach(btn => {
@@ -661,41 +902,62 @@
                 cachedKeys = keysData.keys || [];
                 cachedUpstreams = upstreamsData.upstreams || [];
 
-                if (cachedKeys.length === 0) {
-                    content.innerHTML = '<div class="card text-muted">暂无Key，点击上方按钮添加</div>';
-                    return;
-                }
-
                 let html = `
-                    <div class="card" style="margin-bottom: 1rem;">
-                        <div style="display: flex; gap: 1rem; align-items: center; flex-wrap: wrap;">
-                            <input type="text" class="input" id="base-url-input" placeholder="输入服务基础URL，如: http://localhost:3000" style="flex: 1; min-width: 250px;">
-                            <button class="btn btn-secondary" id="show-usage-btn">📖 使用说明</button>
+                    <div class="dash-card" style="margin-bottom: 1.5rem;">
+                        <div class="dash-card-body">
+                            <div style="display: flex; gap: 1rem; align-items: center; flex-wrap: wrap;">
+                                <input type="text" class="input" id="base-url-input" placeholder="输入服务基础URL，如: http://localhost:3000" style="flex: 1; min-width: 250px;">
+                                <button class="btn btn-secondary" id="show-usage-btn">📖 使用说明</button>
+                            </div>
                         </div>
                     </div>
-                    <div class="card table-container"><table><thead><tr><th>名称</th><th>Key值</th><th>绑定上游</th><th>状态</th><th>操作</th></tr></thead><tbody>
                 `;
 
-                cachedKeys.forEach((k, idx) => {
-                    const badge = k.enabled ? '<span class="badge badge-success">启用</span>' : '<span class="badge badge-danger">禁用</span>';
-                    html += `
-                        <tr>
-                            <td><strong>${escapeHtml(k.name || '未命名')}</strong></td>
-                            <td><code class="text-sm text-muted">${escapeHtml(k.key)}</code></td>
-                            <td>${escapeHtml(k.upstream_name || k.upstream_id?.substring(0,8) || '-')}</td>
-                            <td>${badge}</td>
-                            <td>
-                                <div class="flex gap-2">
-                                    <button class="btn btn-primary btn-sm" data-copy-key="${k.key}" title="复制订阅链接">📋 复制链接</button>
-                                    <button class="btn btn-primary btn-sm" data-key-idx="${idx}">编辑</button>
-                                    <button class="btn btn-danger btn-sm" data-key-del="${k.id}">删除</button>
-                                </div>
-                            </td>
-                        </tr>
-                    `;
-                });
+                if (cachedKeys.length === 0) {
+                    html += '<div class="card text-muted">暂无Key，点击上方按钮添加</div>';
+                } else {
+                    html += '<div class="dashboard-grid">';
+                    cachedKeys.forEach((k, idx) => {
+                        const badge = k.enabled 
+                            ? '<span class="tag tag-green"><span class="tag-dot bg-success"></span>启用</span>' 
+                            : '<span class="tag tag-red"><span class="tag-dot bg-danger"></span>禁用</span>';
+                        
+                        const upstreamName = k.upstream_name || 
+                                           cachedUpstreams.find(u => u.id === k.upstream_id)?.name || 
+                                           k.upstream_id?.substring(0,8) || 
+                                           '-';
 
-                html += '</tbody></table></div>';
+                        html += `
+                            <div class="dash-card">
+                                <div class="dash-card-header">
+                                    <div class="dash-card-title">${escapeHtml(k.name || '未命名')}</div>
+                                    ${badge}
+                                </div>
+                                <div class="dash-card-body">
+                                    <div class="dash-info-group">
+                                        <span class="dash-label">Key</span>
+                                    </div>
+                                    <div class="code-box" style="margin-top: -0.5rem; margin-bottom: 0.5rem; cursor: pointer;" title="点击复制" onclick="navigator.clipboard.writeText('${k.key}'); showToast('已复制Key', 'success');">
+                                        ${escapeHtml(k.key)}
+                                    </div>
+                                    <div class="dash-info-group">
+                                        <span class="dash-label">绑定上游</span>
+                                        <span class="dash-value sm">${escapeHtml(upstreamName)}</span>
+                                    </div>
+                                </div>
+                                <div class="dash-card-footer">
+                                    <div class="dash-actions">
+                                        <button class="btn btn-secondary btn-sm" data-copy-key="${k.key}" title="复制订阅链接">📋</button>
+                                        <button class="btn btn-primary btn-sm" data-key-idx="${idx}">✎</button>
+                                        <button class="btn btn-danger btn-sm" data-key-del="${k.id}">🗑️</button>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    });
+                    html += '</div>';
+                }
+
                 content.innerHTML = html;
 
                 content.querySelectorAll('[data-key-idx]').forEach(btn => {
@@ -711,7 +973,6 @@
                     btn.onclick = () => copySubscribeLink(btn.dataset.copyKey);
                 });
 
-                // 绑定使用说明按钮
                 const showUsageBtn = $('#show-usage-btn');
                 if (showUsageBtn) {
                     showUsageBtn.onclick = () => showHelpModal();
@@ -926,22 +1187,37 @@
                 const data = await api('/logs?page=' + page + '&page_size=50');
                 const logs = data.logs || [];
                 
-                let html = '<div class="card table-container"><table><thead><tr><th>时间</th><th>Key名称</th><th>IP</th><th>缓存</th><th>状态</th></tr></thead><tbody>';
+                let html = `
+                    <div class="dash-card">
+                        <div class="dash-card-header">
+                            <div class="dash-card-title">Access Logs</div>
+                        </div>
+                        <div class="dash-card-body" style="padding:0;">
+                            <div class="table-container">
+                                <table>
+                                    <thead>
+                                        <tr><th>Time</th><th>Key</th><th>IP</th><th>Cache</th><th>Status</th></tr>
+                                    </thead>
+                                    <tbody>
+                `;
                 
                 if (logs.length === 0) {
-                    html += '<tr><td colspan="5" class="text-muted" style="text-align:center">暂无日志</td></tr>';
+                    html += '<tr><td colspan="5" class="text-muted" style="text-align:center; padding: 2rem;">No logs available</td></tr>';
                 } else {
                     logs.forEach(l => {
-                        const cacheHit = l.cache_hit ? '<span class="badge badge-success">命中</span>' : '<span class="badge badge-warning">未命中</span>';
+                        const cacheHit = l.cache_hit 
+                            ? '<span class="tag tag-green">HIT</span>' 
+                            : '<span class="tag tag-gray">MISS</span>';
                         const statusBadge = l.status === 'success' 
-                            ? '<span class="badge badge-success">成功</span>' 
-                            : '<span class="badge badge-danger">失败</span>';
+                            ? '<span class="tag tag-green">200</span>' 
+                            : '<span class="tag tag-red">ERR</span>';
                         const keyDisplay = l.key_name || l.key || '-';
+                        
                         html += `
                             <tr>
                                 <td class="text-sm">${l.time ? new Date(l.time).toLocaleString() : '-'}</td>
                                 <td class="text-sm"><strong>${escapeHtml(keyDisplay)}</strong></td>
-                                <td class="text-sm">${escapeHtml(l.client_ip || '-')}</td>
+                                <td class="text-sm"><span class="code-box">${escapeHtml(l.client_ip || '-')}</span></td>
                                 <td>${cacheHit}</td>
                                 <td>${statusBadge}</td>
                             </tr>
@@ -949,13 +1225,18 @@
                     });
                 }
 
-                html += '</tbody></table></div>';
-
                 html += `
-                    <div class="pagination">
-                        <button class="btn btn-secondary btn-sm" onclick="loadLogPage(${page - 1})" ${page <= 1 ? 'disabled' : ''}>上一页</button>
-                        <span class="text-sm text-muted">第 ${data.page || 1} / ${data.total_pages || 1} 页 (共 ${data.total_count || 0} 条)</span>
-                        <button class="btn btn-secondary btn-sm" onclick="loadLogPage(${page + 1})" ${page >= (data.total_pages || 1) ? 'disabled' : ''}>下一页</button>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                        <div class="dash-card-footer" style="justify-content: center;">
+                            <div class="pagination">
+                                <button class="btn btn-secondary btn-sm" onclick="loadLogPage(${page - 1})" ${page <= 1 ? 'disabled' : ''}>Previous</button>
+                                <span class="text-sm text-muted">Page ${data.page || 1} of ${data.total_pages || 1} (${data.total_count || 0} items)</span>
+                                <button class="btn btn-secondary btn-sm" onclick="loadLogPage(${page + 1})" ${page >= (data.total_pages || 1) ? 'disabled' : ''}>Next</button>
+                            </div>
+                        </div>
                     </div>
                 `;
 
@@ -974,19 +1255,27 @@
                 const config = data.global_config || {};
 
                 content.innerHTML = `
-                    <div class="card">
-                        <div class="card-title">日志设置</div>
-                        <div class="form-group">
-                            <label class="form-label">日志保留天数</label>
-                            <input type="number" class="input" id="setting-retention" value="${config.log_retention_days || 0}" min="0" style="max-width: 200px;">
-                            <div class="form-hint">设置为0表示不自动清理。超过此天数的日志将在新日志写入时自动清理。</div>
+                    <div class="dash-card">
+                        <div class="dash-card-header">
+                            <div class="dash-card-title">Global Configuration</div>
                         </div>
-                        <div class="form-group">
-                            <label class="form-label">活跃UA窗口（天）</label>
-                            <input type="number" class="input" id="setting-active-ua-days" value="${config.active_ua_days || 30}" min="1" style="max-width: 200px;">
-                            <div class="form-hint">强制缓存模式会刷新最近该天数内出现过的UA缓存变体。</div>
+                        <div class="dash-card-body">
+                            <div class="form-group">
+                                <label class="form-label">日志保留天数</label>
+                                <input type="number" class="input" id="setting-retention" value="${config.log_retention_days || 0}" min="0" style="max-width: 200px;">
+                                <div class="form-hint">设置为0表示不自动清理。</div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">活跃UA窗口（天）</label>
+                                <input type="number" class="input" id="setting-active-ua-days" value="${config.active_ua_days || 30}" min="1" style="max-width: 200px;">
+                                <div class="form-hint">强制缓存模式会刷新最近该天数内出现过的UA缓存变体。</div>
+                            </div>
                         </div>
-                        <button class="btn btn-primary" id="save-settings-btn">保存设置</button>
+                        <div class="dash-card-footer">
+                            <div class="dash-actions">
+                                <button class="btn btn-primary" id="save-settings-btn">保存设置</button>
+                            </div>
+                        </div>
                     </div>
                 `;
 
