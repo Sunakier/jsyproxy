@@ -61,18 +61,20 @@ type updateKeyRequest struct {
 }
 
 type upstreamRequest struct {
-	ID               string            `json:"id"`
-	Name             string            `json:"name"`
-	APIEndpoint      string            `json:"api_endpoint"`
-	Authorization    string            `json:"authorization"`
-	RequestUserAgent string            `json:"request_user_agent"`
-	Host             string            `json:"host"`
-	Origin           string            `json:"origin"`
-	Referer          string            `json:"referer"`
-	CustomHeaders    map[string]string `json:"custom_headers"`
-	RefreshInterval  string            `json:"refresh_interval"`
-	CacheStrategy    string            `json:"cache_strategy"`
-	Enabled          bool              `json:"enabled"`
+	ID                        string            `json:"id"`
+	Name                      string            `json:"name"`
+	APIEndpoint               string            `json:"api_endpoint"`
+	NodeStatusAPIEndpoint     string            `json:"node_status_api_endpoint"`
+	NodeStatusRefreshInterval string            `json:"node_status_refresh_interval"`
+	Authorization             string            `json:"authorization"`
+	RequestUserAgent          string            `json:"request_user_agent"`
+	Host                      string            `json:"host"`
+	Origin                    string            `json:"origin"`
+	Referer                   string            `json:"referer"`
+	CustomHeaders             map[string]string `json:"custom_headers"`
+	RefreshInterval           string            `json:"refresh_interval"`
+	CacheStrategy             string            `json:"cache_strategy"`
+	Enabled                   bool              `json:"enabled"`
 }
 
 type globalConfigRequest struct {
@@ -88,10 +90,26 @@ type uaRulesImportRequest struct {
 }
 
 type SubscribeHandler struct {
-	config       *config.Config
-	httpClient   *utils.HTTPClient
-	state        *store.State
-	refreshMutex sync.Map
+	config            *config.Config
+	httpClient        *utils.HTTPClient
+	state             *store.State
+	refreshMutex      sync.Map
+	nodeStatusMu      sync.RWMutex
+	nodeStatusCache   map[string]nodeStatusCacheEntry
+	nodeStatusRunning map[string]bool
+}
+
+type nodeStatusFetchResponse struct {
+	Data []map[string]interface{} `json:"data"`
+}
+
+type nodeStatusCacheEntry struct {
+	Nodes     []gin.H
+	Total     int
+	Online    int
+	FetchedAt time.Time
+	ExpiresAt time.Time
+	LastError string
 }
 
 // refreshLockValue holds the wait group for contended refreshes
@@ -100,14 +118,23 @@ type refreshLockValue struct {
 	doneChan chan struct{}
 }
 
-const refreshContentionTimeout = 10 * time.Second
+const (
+	refreshContentionTimeout = 10 * time.Second
+	nodeStatusCacheTTL       = 10 * time.Minute
+)
 
 func NewSubscribeHandler(cfg *config.Config) (*SubscribeHandler, error) {
 	state, err := store.New(cfg.DataFile, cfg.BootstrapAccessKeys, cfg.DefaultRefreshInterval)
 	if err != nil {
 		return nil, err
 	}
-	return &SubscribeHandler{config: cfg, httpClient: utils.NewHTTPClient(), state: state}, nil
+	return &SubscribeHandler{
+		config:            cfg,
+		httpClient:        utils.NewHTTPClient(),
+		state:             state,
+		nodeStatusCache:   make(map[string]nodeStatusCacheEntry),
+		nodeStatusRunning: make(map[string]bool),
+	}, nil
 }
 
 func (h *SubscribeHandler) ValidateAdminSession(token string) bool {
@@ -271,27 +298,7 @@ func (h *SubscribeHandler) RefreshUpstreamCache(upstreamID, reason, downstreamUA
 		return errors.New("请先配置API端点地址")
 	}
 
-	headers := map[string]string{}
-	if upstream.Authorization != "" {
-		headers["Authorization"] = upstream.Authorization
-	}
-	if upstream.RequestUserAgent != "" {
-		headers["User-Agent"] = upstream.RequestUserAgent
-	}
-	if upstream.Host != "" {
-		headers["Host"] = upstream.Host
-	}
-	if upstream.Origin != "" {
-		headers["Origin"] = upstream.Origin
-	}
-	if upstream.Referer != "" {
-		headers["Referer"] = upstream.Referer
-	}
-	for key, value := range upstream.CustomHeaders {
-		if key != "" && value != "" {
-			headers[key] = value
-		}
-	}
+	headers := buildUpstreamRequestHeaders(upstream)
 
 	resp, err := h.httpClient.MakeRequest(http.MethodGet, upstream.APIEndpoint, headers)
 	if err != nil {
@@ -440,15 +447,19 @@ func (h *SubscribeHandler) AdminStatus(c *gin.Context) {
 	for _, u := range upstreams {
 		cache, hasCache := h.state.GetLatestCache(u.ID)
 		status := gin.H{
-			"id":               u.ID,
-			"name":             u.Name,
-			"enabled":          u.Enabled,
-			"cache_strategy":   u.CacheStrategy,
-			"refresh_interval": u.RefreshInterval,
-			"has_cache":        hasCache,
-			"cache_variants":   h.state.CacheVariantCount(u.ID),
-			"configured":       u.APIEndpoint != "",
+			"id":                           u.ID,
+			"name":                         u.Name,
+			"enabled":                      u.Enabled,
+			"cache_strategy":               u.CacheStrategy,
+			"refresh_interval":             u.RefreshInterval,
+			"has_cache":                    hasCache,
+			"cache_variants":               h.state.CacheVariantCount(u.ID),
+			"configured":                   u.APIEndpoint != "",
+			"node_status_api_endpoint":     u.NodeStatusAPIEndpoint,
+			"node_status_refresh_interval": u.NodeStatusRefreshInterval,
 		}
+
+		status["node_status"] = h.buildNodeStatusPayload(u, false)
 
 		if hasCache {
 			used := cache.TrafficStatus.UsedUpload + cache.TrafficStatus.UsedDownload
@@ -481,6 +492,35 @@ func (h *SubscribeHandler) AdminStatus(c *gin.Context) {
 		"log_count":      h.state.LogCount(),
 		"global_config":  h.state.GetGlobalConfig(),
 	})
+}
+
+func (h *SubscribeHandler) AdminGetUpstreamNodeStatus(c *gin.Context) {
+	upstreamID := strings.TrimSpace(c.Param("id"))
+	upstream, ok := h.state.GetUpstream(upstreamID)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "上游不存在"})
+		return
+	}
+	if strings.TrimSpace(upstream.NodeStatusAPIEndpoint) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "该上游未配置节点状态API"})
+		return
+	}
+	c.JSON(http.StatusOK, h.buildNodeStatusPayload(upstream, true))
+}
+
+func (h *SubscribeHandler) AdminRefreshUpstreamNodeStatus(c *gin.Context) {
+	upstreamID := strings.TrimSpace(c.Param("id"))
+	upstream, ok := h.state.GetUpstream(upstreamID)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "上游不存在"})
+		return
+	}
+	if strings.TrimSpace(upstream.NodeStatusAPIEndpoint) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "该上游未配置节点状态API"})
+		return
+	}
+	started := h.triggerNodeStatusRefresh(upstream, "manual")
+	c.JSON(http.StatusOK, gin.H{"ok": true, "started": started, "upstream_id": upstreamID})
 }
 
 func (h *SubscribeHandler) AdminCacheStatus(c *gin.Context) {
@@ -544,17 +584,19 @@ func (h *SubscribeHandler) AdminAddUpstream(c *gin.Context) {
 		return
 	}
 	upstream := store.Upstream{
-		Name:             strings.TrimSpace(req.Name),
-		APIEndpoint:      strings.TrimSpace(req.APIEndpoint),
-		Authorization:    strings.TrimSpace(req.Authorization),
-		RequestUserAgent: strings.TrimSpace(req.RequestUserAgent),
-		Host:             strings.TrimSpace(req.Host),
-		Origin:           strings.TrimSpace(req.Origin),
-		Referer:          strings.TrimSpace(req.Referer),
-		CustomHeaders:    req.CustomHeaders,
-		RefreshInterval:  req.RefreshInterval,
-		CacheStrategy:    req.CacheStrategy,
-		Enabled:          true,
+		Name:                      strings.TrimSpace(req.Name),
+		APIEndpoint:               strings.TrimSpace(req.APIEndpoint),
+		NodeStatusAPIEndpoint:     strings.TrimSpace(req.NodeStatusAPIEndpoint),
+		NodeStatusRefreshInterval: strings.TrimSpace(req.NodeStatusRefreshInterval),
+		Authorization:             strings.TrimSpace(req.Authorization),
+		RequestUserAgent:          strings.TrimSpace(req.RequestUserAgent),
+		Host:                      strings.TrimSpace(req.Host),
+		Origin:                    strings.TrimSpace(req.Origin),
+		Referer:                   strings.TrimSpace(req.Referer),
+		CustomHeaders:             req.CustomHeaders,
+		RefreshInterval:           req.RefreshInterval,
+		CacheStrategy:             req.CacheStrategy,
+		Enabled:                   true,
 	}
 	if err := h.state.AddUpstream(upstream); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -588,6 +630,8 @@ func (h *SubscribeHandler) AdminUpdateUpstream(c *gin.Context) {
 
 	existing.Name = strings.TrimSpace(req.Name)
 	existing.APIEndpoint = strings.TrimSpace(req.APIEndpoint)
+	existing.NodeStatusAPIEndpoint = strings.TrimSpace(req.NodeStatusAPIEndpoint)
+	existing.NodeStatusRefreshInterval = strings.TrimSpace(req.NodeStatusRefreshInterval)
 	existing.Authorization = strings.TrimSpace(req.Authorization)
 	existing.RequestUserAgent = strings.TrimSpace(req.RequestUserAgent)
 	existing.Host = strings.TrimSpace(req.Host)
@@ -602,6 +646,7 @@ func (h *SubscribeHandler) AdminUpdateUpstream(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	h.clearNodeStatusCache(upstreamID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -611,6 +656,7 @@ func (h *SubscribeHandler) AdminDeleteUpstream(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	h.clearNodeStatusCache(upstreamID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -892,6 +938,251 @@ func mergeAllowedPassthroughHeaders(dst map[string][]string, src http.Header) {
 			continue
 		}
 		dst[key] = append([]string(nil), values...)
+	}
+}
+
+func buildUpstreamRequestHeaders(upstream store.Upstream) map[string]string {
+	headers := map[string]string{}
+	if upstream.Authorization != "" {
+		headers["Authorization"] = upstream.Authorization
+	}
+	if upstream.RequestUserAgent != "" {
+		headers["User-Agent"] = upstream.RequestUserAgent
+	}
+	if upstream.Host != "" {
+		headers["Host"] = upstream.Host
+	}
+	if upstream.Origin != "" {
+		headers["Origin"] = upstream.Origin
+	}
+	if upstream.Referer != "" {
+		headers["Referer"] = upstream.Referer
+	}
+	for key, value := range upstream.CustomHeaders {
+		if key != "" && value != "" {
+			headers[key] = value
+		}
+	}
+	return headers
+}
+
+func (h *SubscribeHandler) triggerNodeStatusRefresh(upstream store.Upstream, reason string) bool {
+	upstreamID := strings.TrimSpace(upstream.ID)
+	if upstreamID == "" {
+		return false
+	}
+
+	h.nodeStatusMu.Lock()
+	if h.nodeStatusRunning[upstreamID] {
+		h.nodeStatusMu.Unlock()
+		return false
+	}
+	h.nodeStatusRunning[upstreamID] = true
+	h.nodeStatusMu.Unlock()
+
+	go func() {
+		nodes, total, online, err := h.fetchUpstreamNodeStatus(upstream)
+		now := time.Now()
+
+		h.nodeStatusMu.Lock()
+		entry := h.nodeStatusCache[upstreamID]
+		if err != nil {
+			entry.LastError = err.Error()
+			if entry.FetchedAt.IsZero() {
+				entry.FetchedAt = now
+			}
+			log.Printf("节点状态刷新失败 upstream=%s reason=%s: %v", upstreamID, reason, err)
+		} else {
+			entry.Nodes = nodes
+			entry.Total = total
+			entry.Online = online
+			entry.FetchedAt = now
+			entry.ExpiresAt = now.Add(nodeStatusCacheTTL)
+			entry.LastError = ""
+			log.Printf("节点状态刷新成功 upstream=%s reason=%s total=%d online=%d", upstreamID, reason, total, online)
+		}
+		h.nodeStatusCache[upstreamID] = entry
+		delete(h.nodeStatusRunning, upstreamID)
+		h.nodeStatusMu.Unlock()
+	}()
+
+	return true
+}
+
+func (h *SubscribeHandler) buildNodeStatusPayload(upstream store.Upstream, includeNodes bool) gin.H {
+	upstreamID := strings.TrimSpace(upstream.ID)
+	h.nodeStatusMu.RLock()
+	entry, hasCache := h.nodeStatusCache[upstreamID]
+	isRunning := h.nodeStatusRunning[upstreamID]
+	h.nodeStatusMu.RUnlock()
+
+	payload := gin.H{
+		"configured":                   strings.TrimSpace(upstream.NodeStatusAPIEndpoint) != "",
+		"cache_ttl_seconds":            int(nodeStatusCacheTTL.Seconds()),
+		"node_status_refresh_interval": upstream.NodeStatusRefreshInterval,
+		"is_refreshing":                isRunning,
+		"has_cache":                    hasCache,
+		"stale":                        true,
+		"total_nodes":                  0,
+		"online_nodes":                 0,
+		"online_rate":                  0.0,
+	}
+
+	if !hasCache {
+		if includeNodes {
+			payload["nodes"] = make([]gin.H, 0)
+		}
+		return payload
+	}
+
+	payload["total_nodes"] = entry.Total
+	payload["online_nodes"] = entry.Online
+	if entry.Total > 0 {
+		payload["online_rate"] = float64(entry.Online) * 100 / float64(entry.Total)
+	}
+	payload["fetched_at"] = entry.FetchedAt.Format(time.RFC3339)
+	if !entry.ExpiresAt.IsZero() {
+		payload["expires_at"] = entry.ExpiresAt.Format(time.RFC3339)
+		payload["stale"] = time.Now().After(entry.ExpiresAt)
+	}
+	if entry.LastError != "" {
+		payload["fetch_error"] = entry.LastError
+	}
+	if includeNodes {
+		payload["nodes"] = entry.Nodes
+	}
+
+	return payload
+}
+
+func (h *SubscribeHandler) clearNodeStatusCache(upstreamID string) {
+	upstreamID = strings.TrimSpace(upstreamID)
+	if upstreamID == "" {
+		return
+	}
+	h.nodeStatusMu.Lock()
+	delete(h.nodeStatusCache, upstreamID)
+	delete(h.nodeStatusRunning, upstreamID)
+	h.nodeStatusMu.Unlock()
+}
+
+func (h *SubscribeHandler) fetchUpstreamNodeStatus(upstream store.Upstream) ([]gin.H, int, int, error) {
+	endpoint := strings.TrimSpace(upstream.NodeStatusAPIEndpoint)
+	if endpoint == "" {
+		return nil, 0, 0, nil
+	}
+
+	headers := buildUpstreamRequestHeaders(upstream)
+	resp, err := h.httpClient.MakeRequest(http.MethodGet, endpoint, headers)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("请求节点状态API失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, 0, 0, fmt.Errorf("节点状态API返回状态码: %d", resp.StatusCode)
+	}
+
+	var payload nodeStatusFetchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, 0, 0, fmt.Errorf("解析节点状态响应失败: %w", err)
+	}
+
+	nodes := make([]gin.H, 0, len(payload.Data))
+	onlineCount := 0
+	for _, item := range payload.Data {
+		id := normalizeNodeStatusID(item["id"])
+		name := normalizeNodeStatusString(item["name"])
+		nodeType := normalizeNodeStatusString(item["type"])
+		host := normalizeNodeStatusString(item["host"])
+		rate := normalizeNodeStatusString(item["rate"])
+		isOnline := normalizeNodeStatusOnline(item["is_online"])
+		lastCheckAt := normalizeNodeStatusUnix(item["last_check_at"])
+		if isOnline {
+			onlineCount++
+		}
+
+		node := gin.H{
+			"id":            id,
+			"name":          name,
+			"type":          nodeType,
+			"host":          host,
+			"rate":          rate,
+			"is_online":     isOnline,
+			"last_check_at": lastCheckAt,
+		}
+		nodes = append(nodes, node)
+	}
+
+	return nodes, len(nodes), onlineCount, nil
+}
+
+func normalizeNodeStatusID(raw interface{}) string {
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case float64:
+		return strconv.FormatInt(int64(v), 10)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case int:
+		return strconv.Itoa(v)
+	default:
+		return ""
+	}
+}
+
+func normalizeNodeStatusString(raw interface{}) string {
+	if raw == nil {
+		return ""
+	}
+	if value, ok := raw.(string); ok {
+		return strings.TrimSpace(value)
+	}
+	return strings.TrimSpace(fmt.Sprint(raw))
+}
+
+func normalizeNodeStatusOnline(raw interface{}) bool {
+	switch v := raw.(type) {
+	case bool:
+		return v
+	case float64:
+		return int(v) != 0
+	case int:
+		return v != 0
+	case int64:
+		return v != 0
+	case string:
+		trimmed := strings.TrimSpace(strings.ToLower(v))
+		if trimmed == "1" || trimmed == "true" || trimmed == "online" {
+			return true
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func normalizeNodeStatusUnix(raw interface{}) int64 {
+	switch v := raw.(type) {
+	case float64:
+		return int64(v)
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return 0
+		}
+		parsed, err := strconv.ParseInt(trimmed, 10, 64)
+		if err != nil {
+			return 0
+		}
+		return parsed
+	default:
+		return 0
 	}
 }
 

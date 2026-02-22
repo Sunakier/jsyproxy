@@ -30,19 +30,21 @@ const (
 )
 
 type Upstream struct {
-	ID               string            `json:"id"`
-	Name             string            `json:"name"`
-	APIEndpoint      string            `json:"api_endpoint"`
-	Authorization    string            `json:"authorization"`
-	RequestUserAgent string            `json:"request_user_agent"`
-	Host             string            `json:"host"`
-	Origin           string            `json:"origin"`
-	Referer          string            `json:"referer"`
-	CustomHeaders    map[string]string `json:"custom_headers,omitempty"`
-	RefreshInterval  string            `json:"refresh_interval"`
-	CacheStrategy    string            `json:"cache_strategy"`
-	Enabled          bool              `json:"enabled"`
-	CreatedAt        time.Time         `json:"created_at"`
+	ID                        string            `json:"id"`
+	Name                      string            `json:"name"`
+	APIEndpoint               string            `json:"api_endpoint"`
+	NodeStatusAPIEndpoint     string            `json:"node_status_api_endpoint,omitempty"`
+	NodeStatusRefreshInterval string            `json:"node_status_refresh_interval,omitempty"`
+	Authorization             string            `json:"authorization"`
+	RequestUserAgent          string            `json:"request_user_agent"`
+	Host                      string            `json:"host"`
+	Origin                    string            `json:"origin"`
+	Referer                   string            `json:"referer"`
+	CustomHeaders             map[string]string `json:"custom_headers,omitempty"`
+	RefreshInterval           string            `json:"refresh_interval"`
+	CacheStrategy             string            `json:"cache_strategy"`
+	Enabled                   bool              `json:"enabled"`
+	CreatedAt                 time.Time         `json:"created_at"`
 }
 
 type AccessKey struct {
@@ -1050,10 +1052,14 @@ func (s *State) AddUpstream(u Upstream) error {
 	if u.RefreshInterval == "" {
 		u.RefreshInterval = "10m"
 	}
+	if u.NodeStatusRefreshInterval == "" {
+		u.NodeStatusRefreshInterval = "10m"
+	}
 	if u.RequestUserAgent == "" {
 		u.RequestUserAgent = defaultUserAgent
 	}
 	u.RefreshInterval = normalizeInterval(u.RefreshInterval)
+	u.NodeStatusRefreshInterval = normalizeInterval(u.NodeStatusRefreshInterval)
 	u.CreatedAt = time.Now()
 	u.Enabled = true
 	s.upstreams[u.ID] = u
@@ -1069,10 +1075,14 @@ func (s *State) UpdateUpstream(u Upstream) error {
 	if u.RefreshInterval == "" {
 		u.RefreshInterval = "10m"
 	}
+	if u.NodeStatusRefreshInterval == "" {
+		u.NodeStatusRefreshInterval = "10m"
+	}
 	if u.RequestUserAgent == "" {
 		u.RequestUserAgent = defaultUserAgent
 	}
 	u.RefreshInterval = normalizeInterval(u.RefreshInterval)
+	u.NodeStatusRefreshInterval = normalizeInterval(u.NodeStatusRefreshInterval)
 	s.upstreams[u.ID] = u
 	return s.saveLocked()
 }

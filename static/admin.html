@@ -327,6 +327,7 @@
                 <div class="sidebar-title">JsyProxy</div>
                 <nav id="nav-menu">
                     <div class="nav-item active" data-view="dashboard">概览</div>
+                    <div class="nav-item" data-view="nodes">节点状态</div>
                     <div class="nav-item" data-view="cache">缓存状态</div>
                     <div class="nav-item" data-view="upstreams">上游管理</div>
                     <div class="nav-item" data-view="keys">Key管理</div>
@@ -358,7 +359,7 @@
         const $ = (sel) => document.querySelector(sel);
         const $$ = (sel) => document.querySelectorAll(sel);
 
-        const state = { view: 'dashboard', logPage: 1 };
+        const state = { view: 'dashboard', logPage: 1, nodeStatusAutoTimers: [], nodesFocusUpstream: '' };
 
         async function api(path, options = {}) {
             const res = await fetch('/admin/api' + path, {
@@ -395,18 +396,31 @@
             navigate('dashboard');
         }
 
+        function clearNodeStatusAutoTimers() {
+            if (!Array.isArray(state.nodeStatusAutoTimers)) {
+                state.nodeStatusAutoTimers = [];
+                return;
+            }
+            state.nodeStatusAutoTimers.forEach(t => {
+                clearInterval(t);
+            });
+            state.nodeStatusAutoTimers = [];
+        }
+
         function navigate(view) {
+            clearNodeStatusAutoTimers();
             state.view = view;
             $$('.nav-item[data-view]').forEach(n => {
                 n.classList.toggle('active', n.dataset.view === view);
             });
             $('#header-actions').innerHTML = '';
             
-            const titles = { dashboard: '概览', cache: '缓存状态', upstreams: '上游管理', keys: 'Key管理', logs: '访问日志', settings: '全局设置' };
+            const titles = { dashboard: '概览', nodes: '节点状态', cache: '缓存状态', upstreams: '上游管理', keys: 'Key管理', logs: '访问日志', settings: '全局设置' };
             $('#page-title').textContent = titles[view] || view;
 
             switch(view) {
                 case 'dashboard': renderDashboard(); break;
+                case 'nodes': renderNodes(); break;
                 case 'cache': renderCache(); break;
                 case 'upstreams': renderUpstreams(); break;
                 case 'keys': renderKeys(); break;
@@ -455,6 +469,34 @@
                         const configuredBadge = u.configured
                             ? '<span class="tag tag-blue"><span class="tag-dot bg-info"></span>已配置</span>'
                             : '<span class="tag tag-gray"><span class="tag-dot bg-warning"></span>未配置</span>';
+
+                        // Node Status Logic (summary only + modal details)
+                        let nodeStatusSection = '';
+                        const nodeStatus = u.node_status || {};
+                        const nodePanelId = `node-status-panel-${u.id}`;
+                        if (nodeStatus.configured) {
+                            nodeStatusSection = `
+                                <div class="traffic-bar-container">
+                                    <div class="traffic-header" style="align-items:center; gap:0.5rem;">
+                                        <span>节点状态概览</span>
+                                        <span class="text-sm text-muted">自动刷新: ${escapeHtml(u.node_status_refresh_interval || '10m')}</span>
+                                    </div>
+                                    <div id="${escapeHtml(nodePanelId)}">
+                                        ${renderNodeStatusPanelHTML(nodeStatus)}
+                                    </div>
+                                    <div class="dash-actions" style="margin-top:0.6rem;">
+                                        <button class="btn btn-secondary btn-sm" data-node-investigate="${escapeHtml(u.id)}" data-node-panel="${escapeHtml(nodePanelId)}">调研拉取</button>
+                                        <button class="btn btn-primary btn-sm" data-node-jump="${escapeHtml(u.id)}">节点列表页</button>
+                                    </div>
+                                </div>
+                            `;
+                        } else {
+                            nodeStatusSection = `
+                                <div class="traffic-bar-container" style="display:flex; justify-content:center; align-items:center; min-height: 58px; color: var(--text-muted); background: var(--bg-body);">
+                                    <span style="font-size:0.82rem">未配置节点状态API</span>
+                                </div>
+                            `;
+                        }
 
                         // Traffic Logic
                         let trafficSection = '';
@@ -535,6 +577,7 @@
                                         <span class="dash-label">变体数量</span>
                                         <span class="dash-value sm">${u.cache_variants || 0}</span>
                                     </div>
+                                    ${nodeStatusSection}
                                     ${trafficSection}
                                 </div>
                                 <div class="dash-card-footer">
@@ -550,6 +593,406 @@
                 html += '</div>';
 
                 content.innerHTML = html;
+                content.querySelectorAll('[data-node-investigate]').forEach(btn => {
+                    btn.onclick = () => investigateNodeStatus(btn.dataset.nodeInvestigate, btn.dataset.nodePanel);
+                });
+                content.querySelectorAll('[data-node-jump]').forEach(btn => {
+                    btn.onclick = () => openNodesTab(btn.dataset.nodeJump);
+                });
+                setupNodeStatusAutoRefresh(data.upstreams || []);
+            } catch (e) {
+                content.innerHTML = '<div class="text-danger">加载失败: ' + escapeHtml(e.message) + '</div>';
+            }
+        }
+
+        function renderNodeStatusPanelHTML(nodeStatus) {
+            const totalNodes = parseInt(nodeStatus.total_nodes) || 0;
+            const onlineNodes = parseInt(nodeStatus.online_nodes) || 0;
+            const onlineRate = totalNodes > 0
+                ? ((onlineNodes / totalNodes) * 100)
+                : (parseFloat(nodeStatus.online_rate) || 0);
+            const rateClamped = Math.max(0, Math.min(onlineRate, 100));
+            const statusText = nodeStatus.fetch_error
+                ? escapeHtml(nodeStatus.fetch_error)
+                : (nodeStatus.is_refreshing ? '异步拉取中...' : (nodeStatus.has_cache ? '缓存可用' : '等待调研拉取'));
+            const fetchedText = nodeStatus.fetched_at ? new Date(nodeStatus.fetched_at).toLocaleString() : '-';
+            const expireText = nodeStatus.expires_at ? new Date(nodeStatus.expires_at).toLocaleString() : '-';
+
+            return `
+                <div class="traffic-header">
+                    <span>${onlineNodes}/${totalNodes} (${onlineRate.toFixed(1)}%)</span>
+                    <span>${nodeStatus.stale ? '缓存过期' : '缓存有效'}</span>
+                </div>
+                <div class="traffic-bar-bg">
+                    <div class="traffic-bar-fill ${rateClamped < 50 ? 'danger' : (rateClamped < 80 ? 'warning' : '')}" style="width: ${rateClamped}%"></div>
+                </div>
+                <div class="traffic-sub" style="display:flex; justify-content:space-between;">
+                    <span>${statusText}</span>
+                    <span>更新: ${fetchedText}</span>
+                </div>
+                <div class="traffic-sub" style="display:flex; justify-content:space-between;">
+                    <span>过期: ${expireText}</span>
+                    <span>TTL: ${nodeStatus.cache_ttl_seconds || 600}s</span>
+                </div>
+            `;
+        }
+
+        async function investigateNodeStatus(upstreamID, panelID, options = {}) {
+            if (!upstreamID || !panelID) return;
+            const panel = document.getElementById(panelID);
+            const forceRefresh = !!options.forceRefresh;
+            const silent = !!options.silent;
+
+            let cachedData = null;
+            try {
+                cachedData = await api('/upstreams/' + encodeURIComponent(upstreamID) + '/node-status');
+                if (panel) panel.innerHTML = renderNodeStatusPanelHTML(cachedData);
+            } catch (e) {
+                // 如果首次读取缓存失败，继续尝试触发刷新
+            }
+
+            if (!forceRefresh && cachedData && cachedData.has_cache && !cachedData.stale) {
+                const shouldForceRefresh = confirm('当前节点状态缓存仍在有效期内（10m）。是否强制刷新以获取最新状态？');
+                if (!shouldForceRefresh) {
+                    if (!silent) showToast('已展示有效缓存，未触发强制刷新', 'info');
+                    return;
+                }
+            }
+
+            try {
+                await api('/upstreams/' + encodeURIComponent(upstreamID) + '/node-status/refresh', { method: 'POST' });
+                if (!silent) showToast('已触发异步拉取，正在轮询状态...', 'success');
+            } catch (e) {
+                if (!silent) showToast(e.message, 'error');
+                return;
+            }
+
+            const maxPoll = 45;
+            for (let i = 0; i < maxPoll; i++) {
+                try {
+                    const data = await api('/upstreams/' + encodeURIComponent(upstreamID) + '/node-status');
+                    if (panel) panel.innerHTML = renderNodeStatusPanelHTML(data);
+                    if (!data.is_refreshing) {
+                        if (!silent) showToast('节点状态拉取完成', 'success');
+                        break;
+                    }
+                } catch (e) {
+                    if (!silent) showToast(e.message, 'error');
+                    break;
+                }
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+        }
+
+        function parseIntervalToMs(raw) {
+            const value = String(raw || '10m').trim().toLowerCase();
+            const match = value.match(/^(\d+)(ms|s|m|h)?$/);
+            if (!match) return 10 * 60 * 1000;
+            const num = parseInt(match[1], 10);
+            const unit = match[2] || 's';
+            if (unit === 'ms') return Math.max(1000, num);
+            if (unit === 's') return Math.max(1000, num * 1000);
+            if (unit === 'm') return Math.max(1000, num * 60 * 1000);
+            if (unit === 'h') return Math.max(1000, num * 60 * 60 * 1000);
+            return 10 * 60 * 1000;
+        }
+
+        function setupNodeStatusAutoRefresh(upstreams) {
+            clearNodeStatusAutoTimers();
+            upstreams.forEach(u => {
+                const nodeStatus = u.node_status || {};
+                if (!nodeStatus.configured) return;
+                const panelID = `node-status-panel-${u.id}`;
+                const intervalMs = parseIntervalToMs(u.node_status_refresh_interval || '10m');
+                const timer = setInterval(() => {
+                    if (state.view !== 'dashboard') return;
+                    investigateNodeStatus(u.id, panelID, { forceRefresh: true, silent: true });
+                }, intervalMs);
+                state.nodeStatusAutoTimers.push(timer);
+            });
+        }
+
+        function openNodesTab(upstreamID) {
+            state.nodesFocusUpstream = String(upstreamID || '').trim();
+            navigate('nodes');
+        }
+
+
+        async function loadUpstreamNodeStatus(upstream, options = {}) {
+            const forceRefresh = !!options.forceRefresh;
+            const upstreamID = upstream.id;
+            let data = await api('/upstreams/' + encodeURIComponent(upstreamID) + '/node-status');
+
+            const needRefresh = forceRefresh || !data.has_cache || data.stale;
+            if (needRefresh) {
+                await api('/upstreams/' + encodeURIComponent(upstreamID) + '/node-status/refresh', { method: 'POST' });
+                for (let i = 0; i < 45; i++) {
+                    data = await api('/upstreams/' + encodeURIComponent(upstreamID) + '/node-status');
+                    if (!data.is_refreshing) break;
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            }
+            return data;
+        }
+
+        function flattenNodeRecords(entries) {
+            return entries.flatMap(({ upstream, data, error }) => {
+                if (error || !data || !Array.isArray(data.nodes)) return [];
+                return data.nodes.map(n => ({
+                    upstream_id: upstream.id || '',
+                    upstream_name: upstream.name || '-',
+                    id: n.id || '-',
+                    name: n.name || '-',
+                    type: n.type || '-',
+                    host: n.host || '-',
+                    rate: n.rate || '-',
+                    is_online: !!n.is_online,
+                    last_check_at: Number(n.last_check_at) || 0
+                }));
+            });
+        }
+
+        function sortNodeRecords(records, sortBy, sortOrder) {
+            const factor = sortOrder === 'asc' ? 1 : -1;
+            const sorted = [...records];
+            sorted.sort((a, b) => {
+                let av = a[sortBy];
+                let bv = b[sortBy];
+
+                if (sortBy === 'is_online') {
+                    av = a.is_online ? 1 : 0;
+                    bv = b.is_online ? 1 : 0;
+                } else if (sortBy === 'last_check_at') {
+                    av = Number(a.last_check_at) || 0;
+                    bv = Number(b.last_check_at) || 0;
+                } else if (sortBy === 'rate') {
+                    av = parseFloat(String(a.rate).replace(/[^\d.\-]/g, '')) || 0;
+                    bv = parseFloat(String(b.rate).replace(/[^\d.\-]/g, '')) || 0;
+                } else {
+                    av = String(av || '').toLowerCase();
+                    bv = String(bv || '').toLowerCase();
+                }
+
+                if (av < bv) return -1 * factor;
+                if (av > bv) return 1 * factor;
+                return 0;
+            });
+            return sorted;
+        }
+
+        function renderNodeRowsHTML(records) {
+            return records.map(n => {
+                const onlineBadge = n.is_online
+                    ? '<span class="tag tag-green">在线</span>'
+                    : '<span class="tag tag-red">离线</span>';
+                const checkAt = n.last_check_at > 0
+                    ? new Date(n.last_check_at * 1000).toLocaleString()
+                    : '-';
+                return `
+                    <tr>
+                        <td>${escapeHtml(n.upstream_name)}</td>
+                        <td>${escapeHtml(n.id)}</td>
+                        <td>${escapeHtml(n.name)}</td>
+                        <td>${escapeHtml(n.type)}</td>
+                        <td>${escapeHtml(n.host)}</td>
+                        <td>${escapeHtml(n.rate)}</td>
+                        <td>${onlineBadge}</td>
+                        <td>${escapeHtml(checkAt)}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        async function renderNodes(options = {}) {
+            const forceRefresh = !!options.forceRefresh;
+            const content = $('#content-area');
+            content.innerHTML = '<div class="text-muted">加载节点页面中...</div>';
+
+            $('#header-actions').innerHTML = `
+                <button class="btn btn-secondary btn-sm" id="nodes-refresh-cache">刷新(优先缓存)</button>
+                <button class="btn btn-primary btn-sm" id="nodes-refresh-force">强制全量拉取</button>
+            `;
+            $('#nodes-refresh-cache').onclick = () => renderNodes({ forceRefresh: false });
+            $('#nodes-refresh-force').onclick = () => renderNodes({ forceRefresh: true });
+
+            try {
+                const statusData = await api('/status');
+                const upstreams = (statusData.upstreams || []).filter(u => u.node_status_api_endpoint);
+
+                if (upstreams.length === 0) {
+                    content.innerHTML = '<div class="card text-muted">暂无配置节点状态API的上游，请先在上游管理中配置。</div>';
+                    return;
+                }
+
+                const loadingCards = upstreams.map(u => `
+                    <div class="dash-card">
+                        <div class="dash-card-header"><div class="dash-card-title">${escapeHtml(u.name || '未命名')}</div></div>
+                        <div class="dash-card-body"><span class="text-muted">正在拉取节点状态...</span></div>
+                    </div>
+                `).join('');
+
+                const upstreamFilterOptions = ['<option value="">全部上游</option>']
+                    .concat(upstreams.map(u => `<option value="${escapeHtml(u.id)}">${escapeHtml(u.name || '未命名')}</option>`))
+                    .join('');
+
+                content.innerHTML = `
+                    <div class="stats-grid" style="margin-bottom: 1rem;" id="nodes-summary-grid"></div>
+                    <div class="card" style="margin-bottom: 1rem; padding: 0.9rem;">
+                        <div class="flex gap-2 items-center" style="flex-wrap: wrap;">
+                            <select id="nodes-filter-upstream" class="input" style="max-width: 220px;">${upstreamFilterOptions}</select>
+                            <input id="nodes-filter-keyword" class="input" style="max-width: 320px;" placeholder="搜索名称/Host/类型/ID">
+                            <label style="display:flex; align-items:center; gap:0.4rem;"><input type="checkbox" id="nodes-filter-online"> 仅在线</label>
+                            <select id="nodes-sort-by" class="input" style="max-width: 180px;">
+                                <option value="upstream_name">按上游</option>
+                                <option value="name">按名称</option>
+                                <option value="host">按Host</option>
+                                <option value="type">按类型</option>
+                                <option value="rate">按倍率</option>
+                                <option value="is_online">按状态</option>
+                                <option value="last_check_at">按最后检测</option>
+                            </select>
+                            <select id="nodes-sort-order" class="input" style="max-width: 140px;">
+                                <option value="asc">升序</option>
+                                <option value="desc" selected>降序</option>
+                            </select>
+                            <select id="nodes-page-size" class="input" style="max-width: 140px;">
+                                <option value="20">20/页</option>
+                                <option value="50" selected>50/页</option>
+                                <option value="100">100/页</option>
+                                <option value="200">200/页</option>
+                            </select>
+                            <span class="text-sm text-muted">完整节点列表（支持上游过滤 / 搜索 / 排序 / 分页）</span>
+                        </div>
+                    </div>
+                    <div class="dashboard-grid" id="nodes-upstream-cards">${loadingCards}</div>
+                    <div class="table-container" style="margin-top: 1rem;">
+                        <table>
+                            <thead>
+                                <tr><th>上游</th><th>ID</th><th>名称</th><th>类型</th><th>Host</th><th>倍率</th><th>状态</th><th>最后检测</th></tr>
+                            </thead>
+                            <tbody id="nodes-full-table-body">
+                                <tr><td colspan="8" class="text-muted" style="text-align:center; padding:1rem;">加载中...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="flex items-center justify-between" style="margin-top:0.75rem; gap:0.5rem; flex-wrap: wrap;">
+                        <div id="nodes-page-info" class="text-sm text-muted">-</div>
+                        <div class="dash-actions">
+                            <button class="btn btn-secondary btn-sm" id="nodes-page-prev">上一页</button>
+                            <button class="btn btn-secondary btn-sm" id="nodes-page-next">下一页</button>
+                        </div>
+                    </div>
+                `;
+
+                const entries = await Promise.all(upstreams.map(async upstream => {
+                    try {
+                        const data = await loadUpstreamNodeStatus(upstream, { forceRefresh });
+                        return { upstream, data, error: null };
+                    } catch (e) {
+                        return { upstream, data: null, error: e };
+                    }
+                }));
+
+                const cardsHTML = entries.map(({ upstream, data, error }) => {
+                    if (error) {
+                        return `
+                            <div class="dash-card">
+                                <div class="dash-card-header"><div class="dash-card-title">${escapeHtml(upstream.name || '未命名')}</div></div>
+                                <div class="dash-card-body"><span class="text-danger">拉取失败: ${escapeHtml(error.message || '未知错误')}</span></div>
+                            </div>
+                        `;
+                    }
+                    const total = parseInt(data.total_nodes) || 0;
+                    const online = parseInt(data.online_nodes) || 0;
+                    const rate = total > 0 ? (online * 100 / total) : 0;
+                    return `
+                        <div class="dash-card">
+                            <div class="dash-card-header"><div class="dash-card-title">${escapeHtml(upstream.name || '未命名')}</div></div>
+                            <div class="dash-card-body">
+                                <div class="dash-info-group"><span class="dash-label">在线率</span><span class="dash-value sm">${online}/${total} (${rate.toFixed(1)}%)</span></div>
+                                <div class="dash-info-group"><span class="dash-label">自动刷新</span><span class="dash-value sm">${escapeHtml(upstream.node_status_refresh_interval || '10m')}</span></div>
+                                <div class="dash-info-group"><span class="dash-label">缓存状态</span><span class="dash-value sm">${data.stale ? '<span class="text-warning">过期</span>' : '<span class="text-success">有效</span>'}</span></div>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+                $('#nodes-upstream-cards').innerHTML = cardsHTML;
+
+                if (state.nodesFocusUpstream) {
+                    const upstreamSelect = $('#nodes-filter-upstream');
+                    if (upstreamSelect) {
+                        upstreamSelect.value = state.nodesFocusUpstream;
+                    }
+                    state.nodesFocusUpstream = '';
+                }
+
+                let currentPage = 1;
+                const buildTable = () => {
+                    const upstreamID = $('#nodes-filter-upstream')?.value || '';
+                    const keyword = $('#nodes-filter-keyword')?.value || '';
+                    const onlyOnline = !!$('#nodes-filter-online')?.checked;
+                    const sortBy = $('#nodes-sort-by')?.value || 'upstream_name';
+                    const sortOrder = $('#nodes-sort-order')?.value || 'desc';
+                    const pageSize = parseInt($('#nodes-page-size')?.value || '50', 10);
+                    const kw = String(keyword).trim().toLowerCase();
+
+                    let records = flattenNodeRecords(entries).filter(n => {
+                        if (upstreamID && n.upstream_id !== upstreamID) return false;
+                        if (onlyOnline && !n.is_online) return false;
+                        if (!kw) return true;
+                        const text = `${n.upstream_name} ${n.id} ${n.name} ${n.type} ${n.host}`.toLowerCase();
+                        return text.includes(kw);
+                    });
+
+                    records = sortNodeRecords(records, sortBy, sortOrder);
+
+                    const total = records.length;
+                    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+                    if (currentPage > totalPages) currentPage = totalPages;
+                    if (currentPage < 1) currentPage = 1;
+
+                    const start = (currentPage - 1) * pageSize;
+                    const pageRecords = records.slice(start, start + pageSize);
+
+                    const onlineCount = records.filter(r => r.is_online).length;
+                    const totalCount = records.length;
+                    const onlineRate = totalCount > 0 ? (onlineCount * 100 / totalCount) : 0;
+                    $('#nodes-summary-grid').innerHTML = `
+                        <div class="card stat-card"><div class="stat-value">${totalCount}</div><div class="stat-label">筛选后节点总数</div></div>
+                        <div class="card stat-card"><div class="stat-value">${onlineCount}</div><div class="stat-label">在线节点</div></div>
+                        <div class="card stat-card"><div class="stat-value">${onlineRate.toFixed(1)}%</div><div class="stat-label">在线率</div></div>
+                        <div class="card stat-card"><div class="stat-value">${upstreams.length}</div><div class="stat-label">上游数量</div></div>
+                    `;
+
+                    $('#nodes-full-table-body').innerHTML = pageRecords.length > 0
+                        ? renderNodeRowsHTML(pageRecords)
+                        : '<tr><td colspan="8" class="text-muted" style="text-align:center; padding:1rem;">无匹配节点</td></tr>';
+                    $('#nodes-page-info').textContent = `共 ${total} 条，当前第 ${currentPage}/${totalPages} 页`;
+                    $('#nodes-page-prev').disabled = currentPage <= 1;
+                    $('#nodes-page-next').disabled = currentPage >= totalPages;
+                };
+
+                const resetAndBuild = () => {
+                    currentPage = 1;
+                    buildTable();
+                };
+
+                $('#nodes-filter-upstream').onchange = resetAndBuild;
+                $('#nodes-filter-keyword').oninput = resetAndBuild;
+                $('#nodes-filter-online').onchange = resetAndBuild;
+                $('#nodes-sort-by').onchange = resetAndBuild;
+                $('#nodes-sort-order').onchange = resetAndBuild;
+                $('#nodes-page-size').onchange = resetAndBuild;
+                $('#nodes-page-prev').onclick = () => {
+                    currentPage -= 1;
+                    buildTable();
+                };
+                $('#nodes-page-next').onclick = () => {
+                    currentPage += 1;
+                    buildTable();
+                };
+
+                buildTable();
             } catch (e) {
                 content.innerHTML = '<div class="text-danger">加载失败: ' + escapeHtml(e.message) + '</div>';
             }
@@ -730,6 +1173,16 @@
                                 <div class="code-box" style="margin-top: -0.5rem; margin-bottom: 0.5rem;">
                                     ${escapeHtml(u.api_endpoint || '-')}
                                 </div>
+                                <div class="dash-info-group">
+                                    <span class="dash-label">节点状态API</span>
+                                </div>
+                                <div class="code-box" style="margin-top: -0.5rem; margin-bottom: 0.5rem;">
+                                    ${escapeHtml(u.node_status_api_endpoint || '-')}
+                                </div>
+                                <div class="dash-info-group">
+                                    <span class="dash-label">节点自动刷新</span>
+                                    <span class="dash-value sm">${escapeHtml(u.node_status_refresh_interval || '10m')}</span>
+                                </div>
                                 
                                 <div class="dash-info-group">
                                     <span class="dash-label">策略</span>
@@ -843,6 +1296,16 @@
                     <input type="text" class="input" id="up-url" value="${escapeHtml(data?.api_endpoint || '')}" placeholder="https://..." required>
                 </div>
                 <div class="form-group">
+                    <label class="form-label">节点状态API（可选）</label>
+                    <input type="text" class="input" id="up-node-status-url" value="${escapeHtml(data?.node_status_api_endpoint || '')}" placeholder="https://.../api/v1/user/server/fetch">
+                    <div class="form-hint">与上方API共用 Authorization / UA / Host / Origin / Referer / 自定义请求头，仅请求地址不同。</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">节点状态自动刷新周期</label>
+                    <input type="text" class="input" id="up-node-status-interval" value="${escapeHtml(data?.node_status_refresh_interval || '10m')}" placeholder="10m / 5m / 30s">
+                    <div class="form-hint">仅用于前端概览自动调研拉取，可单独配置，默认 10m。</div>
+                </div>
+                <div class="form-group">
                     <label class="form-label">Authorization</label>
                     <input type="text" class="input" id="up-auth" value="${escapeHtml(data?.authorization || '')}">
                 </div>
@@ -901,6 +1364,8 @@
                 const payload = {
                     name: $('#up-name').value.trim(),
                     api_endpoint: $('#up-url').value.trim(),
+                    node_status_api_endpoint: $('#up-node-status-url').value.trim(),
+                    node_status_refresh_interval: $('#up-node-status-interval').value.trim() || '10m',
                     authorization: $('#up-auth').value.trim(),
                     request_user_agent: $('#up-ua').value.trim(),
                     host: $('#up-host').value.trim(),

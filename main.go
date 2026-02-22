@@ -54,6 +54,8 @@ func main() {
 		adminAPI.PUT("/upstreams/:id", subscribeHandler.AdminUpdateUpstream)
 		adminAPI.DELETE("/upstreams/:id", subscribeHandler.AdminDeleteUpstream)
 		adminAPI.POST("/upstreams/:id/refresh", subscribeHandler.AdminRefreshUpstream)
+		adminAPI.GET("/upstreams/:id/node-status", subscribeHandler.AdminGetUpstreamNodeStatus)
+		adminAPI.POST("/upstreams/:id/node-status/refresh", subscribeHandler.AdminRefreshUpstreamNodeStatus)
 		adminAPI.POST("/upstreams/:id/dedupe", subscribeHandler.AdminDedupeUpstreamCache)
 		adminAPI.DELETE("/upstreams/:id/ua-cache", subscribeHandler.AdminDeleteUpstreamUACache)
 
