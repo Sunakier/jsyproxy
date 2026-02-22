@@ -8,18 +8,26 @@
         :root {
             --primary: #3b82f6;
             --primary-hover: #2563eb;
+            --primary-soft: #dbeafe;
             --bg-body: #f3f4f6;
             --bg-sidebar: #1f2937;
             --bg-card: #ffffff;
+            --bg-elevated: #ffffff;
+            --bg-input: #ffffff;
             --text-main: #111827;
             --text-muted: #6b7280;
             --text-light: #f9fafb;
             --border: #e5e7eb;
+            --border-strong: #cbd5e1;
             --danger: #ef4444;
             --success: #10b981;
             --warning: #f59e0b;
+            --focus-ring: rgba(59, 130, 246, 0.25);
+            --disabled-bg: #f1f5f9;
             --radius: 8px;
+            --radius-sm: 6px;
             --shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06);
+            --shadow-focus: 0 0 0 4px var(--focus-ring);
         }
 
         @media (prefers-color-scheme: dark) {
@@ -27,9 +35,15 @@
                 --bg-body: #111827;
                 --bg-sidebar: #0f172a;
                 --bg-card: #1f2937;
+                --bg-elevated: #111827;
+                --bg-input: #1f2937;
                 --text-main: #f9fafb;
                 --text-muted: #9ca3af;
                 --border: #374151;
+                --border-strong: #4b5563;
+                --primary-soft: rgba(59, 130, 246, 0.2);
+                --focus-ring: rgba(59, 130, 246, 0.35);
+                --disabled-bg: #111827;
             }
         }
 
@@ -51,16 +65,166 @@
         .text-success { color: var(--success); }
         .text-muted { color: var(--text-muted); }
         
-        .btn { padding: 0.5rem 1rem; border-radius: var(--radius); border: none; cursor: pointer; font-weight: 500; transition: all 0.2s; font-size: 0.9rem; display: inline-flex; align-items: center; gap: 0.5rem; }
-        .btn-primary { background: var(--primary); color: white; }
-        .btn-primary:hover { background: var(--primary-hover); }
-        .btn-danger { background: var(--danger); color: white; }
-        .btn-secondary { background: transparent; border: 1px solid var(--border); color: var(--text-main); }
-        .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.8rem; }
-        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn {
+            padding: 0.56rem 1rem;
+            border-radius: var(--radius-sm);
+            border: 1px solid transparent;
+            cursor: pointer;
+            font-weight: 600;
+            letter-spacing: 0.01em;
+            transition: all 0.2s ease;
+            font-size: 0.88rem;
+            line-height: 1.15;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.45rem;
+            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.12);
+            user-select: none;
+        }
+        .btn:hover:not(:disabled) { transform: translateY(-1px); }
+        .btn:active:not(:disabled) { transform: translateY(0); box-shadow: inset 0 1px 2px rgba(0,0,0,0.18); }
+        .btn:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+        .btn-primary {
+            background: linear-gradient(180deg, var(--primary), var(--primary-hover));
+            color: white;
+        }
+        .btn-primary:hover:not(:disabled) { filter: brightness(1.04); }
+        .btn-danger {
+            background: linear-gradient(180deg, #f87171, var(--danger));
+            color: white;
+        }
+        .btn-danger:hover:not(:disabled) { filter: brightness(1.05); }
+        .btn-secondary {
+            background: var(--bg-elevated);
+            border-color: var(--border-strong);
+            color: var(--text-main);
+        }
+        .btn-secondary:hover:not(:disabled) {
+            border-color: var(--primary);
+            color: var(--primary-hover);
+            background: var(--primary-soft);
+        }
+        .btn-sm { padding: 0.35rem 0.62rem; font-size: 0.79rem; }
+        .btn:disabled {
+            opacity: 0.58;
+            cursor: not-allowed;
+            box-shadow: none;
+            transform: none;
+        }
 
-        .input, .select { width: 100%; padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-card); color: var(--text-main); font-size: 0.9rem; }
-        .input:focus, .select:focus { outline: 2px solid var(--primary); border-color: transparent; }
+        .input, .select {
+            width: 100%;
+            padding: 0.56rem 0.78rem;
+            border: 1px solid var(--border-strong);
+            border-radius: var(--radius-sm);
+            background: var(--bg-input);
+            color: var(--text-main);
+            font-size: 0.9rem;
+            line-height: 1.3;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease;
+        }
+        .input:hover, .select:hover { border-color: var(--primary); }
+        .input:focus, .select:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: var(--shadow-focus);
+            background: var(--bg-elevated);
+        }
+        .input::placeholder { color: #94a3b8; }
+        @media (prefers-color-scheme: dark) {
+            .input::placeholder { color: #64748b; }
+        }
+        .input:disabled, .select:disabled {
+            background: var(--disabled-bg);
+            color: var(--text-muted);
+            cursor: not-allowed;
+            border-color: var(--border);
+        }
+
+        select.input,
+        .select {
+            appearance: none;
+            -webkit-appearance: none;
+            -moz-appearance: none;
+            padding-right: 2rem;
+            background-image: linear-gradient(45deg, transparent 50%, var(--text-muted) 50%), linear-gradient(135deg, var(--text-muted) 50%, transparent 50%);
+            background-position: calc(100% - 15px) calc(50% - 3px), calc(100% - 10px) calc(50% - 3px);
+            background-size: 5px 5px, 5px 5px;
+            background-repeat: no-repeat;
+        }
+
+        textarea.input {
+            min-height: 92px;
+            resize: vertical;
+        }
+
+        input[type='checkbox'],
+        input[type='radio'] {
+            appearance: none;
+            -webkit-appearance: none;
+            margin: 0;
+            width: 1rem;
+            height: 1rem;
+            border: 1px solid var(--border-strong);
+            background: var(--bg-input);
+            display: inline-grid;
+            place-content: center;
+            cursor: pointer;
+            transition: all 0.18s ease;
+            position: relative;
+            top: 0.04rem;
+        }
+        input[type='checkbox'] { border-radius: 0.28rem; }
+        input[type='radio'] { border-radius: 50%; }
+        input[type='checkbox']::before,
+        input[type='radio']::before {
+            content: '';
+            width: 0.55rem;
+            height: 0.55rem;
+            transform: scale(0);
+            transition: transform 0.15s ease;
+        }
+        input[type='checkbox']::before {
+            clip-path: polygon(14% 44%, 0 61%, 45% 100%, 100% 16%, 84% 0, 43% 62%);
+            background: #ffffff;
+        }
+        input[type='radio']::before {
+            border-radius: 50%;
+            background: #ffffff;
+            width: 0.44rem;
+            height: 0.44rem;
+        }
+        input[type='checkbox']:checked,
+        input[type='radio']:checked {
+            background: linear-gradient(180deg, var(--primary), var(--primary-hover));
+            border-color: var(--primary-hover);
+        }
+        input[type='checkbox']:checked::before,
+        input[type='radio']:checked::before {
+            transform: scale(1);
+        }
+        input[type='checkbox']:hover,
+        input[type='radio']:hover {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px var(--focus-ring);
+        }
+        input[type='checkbox']:focus-visible,
+        input[type='radio']:focus-visible {
+            outline: none;
+            box-shadow: var(--shadow-focus);
+        }
+        input[type='checkbox']:disabled,
+        input[type='radio']:disabled {
+            cursor: not-allowed;
+            opacity: 0.6;
+            box-shadow: none;
+        }
+        label { color: var(--text-main); }
+        label > input[type='checkbox'],
+        label > input[type='radio'] {
+            margin-right: 0.4rem;
+        }
         
         .card { background: var(--bg-card); border-radius: var(--radius); padding: 1.5rem; box-shadow: var(--shadow); margin-bottom: 1rem; }
         .card-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem; }
@@ -88,9 +252,69 @@
         .upstream-name { font-weight: 600; font-size: 1.1rem; }
         .upstream-detail { font-size: 0.875rem; color: var(--text-muted); line-height: 1.6; }
         .upstream-traffic { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border); }
-        .ua-cache-table-wrap { margin-top: 0.75rem; }
+        .ua-cache-table-wrap { margin-top: 0.75rem; border-top: 1px solid var(--border); padding-top: 0.6rem; }
+        .ua-cache-toolbar { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; margin-bottom: 0.55rem; }
+        .ua-cache-toolbar .input { max-width: 220px; min-width: 160px; }
+        .ua-cache-summary { font-size: 0.78rem; color: var(--text-muted); }
+        .ua-cache-table-wrap .table-container {
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            overflow: auto;
+            max-height: 300px;
+        }
+        .ua-cache-table-wrap table { table-layout: fixed; min-width: 680px; }
         .ua-cache-table-wrap table th,
-        .ua-cache-table-wrap table td { padding: 0.4rem 0.5rem; font-size: 0.78rem; }
+        .ua-cache-table-wrap table td { padding: 0.4rem 0.5rem; font-size: 0.78rem; vertical-align: top; }
+        .ua-cache-table-wrap table th:nth-child(1),
+        .ua-cache-table-wrap table td:nth-child(1) { width: 50%; }
+        .ua-cache-table-wrap table th:nth-child(2),
+        .ua-cache-table-wrap table td:nth-child(2) { width: 16%; }
+        .ua-cache-table-wrap table th:nth-child(3),
+        .ua-cache-table-wrap table td:nth-child(3) { width: 14%; }
+        .ua-cache-table-wrap table th:nth-child(4),
+        .ua-cache-table-wrap table td:nth-child(4) { width: 20%; }
+        .ua-cache-ua-text {
+            display: block;
+            white-space: normal;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+            line-height: 1.35;
+            max-height: 5.4em;
+            overflow-y: auto;
+            padding-right: 0.2rem;
+        }
+        .ua-cache-meta { font-size: 0.72rem; color: var(--text-muted); margin-top: 0.2rem; }
+        .cache-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(440px, 1fr));
+            gap: 1rem;
+            margin-top: 0.75rem;
+        }
+        .cache-card .dash-card-header {
+            align-items: flex-start;
+            gap: 0.6rem;
+            flex-wrap: wrap;
+        }
+        .cache-card-title-wrap { display: flex; flex-direction: column; gap: 0.35rem; }
+        .cache-card-title-wrap .dash-card-title { line-height: 1.25; }
+        .cache-summary-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 0.5rem;
+        }
+        .cache-pill {
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            background: var(--bg-body);
+            padding: 0.55rem 0.6rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.2rem;
+        }
+        .cache-pill-label { font-size: 0.72rem; color: var(--text-muted); }
+        .cache-pill-value { font-size: 0.88rem; color: var(--text-main); font-weight: 600; }
+        .ua-toggle-row { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.45rem; }
+        .ua-toggle-tip { font-size: 0.78rem; color: var(--text-muted); }
 
         .table-container { overflow-x: auto; }
         table { width: 100%; border-collapse: collapse; text-align: left; }
@@ -126,6 +350,9 @@
             .sidebar.open { transform: translateX(0); }
             .main-content { margin-left: 0; }
             .menu-toggle { display: block !important; }
+            .cache-grid { grid-template-columns: 1fr; gap: 0.8rem; }
+            .cache-summary-row { grid-template-columns: 1fr 1fr; }
+            .ua-cache-toolbar .input { max-width: 100%; min-width: 130px; }
         }
 
         /* Dashboard Card Styles */
@@ -1150,6 +1377,134 @@
             }
         }
 
+        function sortUACacheStatuses(statuses) {
+            const list = Array.isArray(statuses) ? [...statuses] : [];
+            list.sort((a, b) => {
+                const reqA = Number(a?.total_requests || 0);
+                const reqB = Number(b?.total_requests || 0);
+                if (reqA !== reqB) return reqB - reqA;
+                const seenA = a?.last_seen_at ? new Date(a.last_seen_at).getTime() : 0;
+                const seenB = b?.last_seen_at ? new Date(b.last_seen_at).getTime() : 0;
+                return seenB - seenA;
+            });
+            return list;
+        }
+
+        function renderCacheUARows(rows, upstreamID, canWriteUpstream) {
+            return rows.map(item => {
+                const uaText = item.is_default ? '默认UA' : (item.user_agent || '-');
+                const uaDisplay = item.is_default
+                    ? '<span class="tag tag-blue">默认UA</span>'
+                    : `<span class="ua-cache-ua-text" title="${escapeHtml(uaText)}">${escapeHtml(uaText)}</span>`;
+
+                const hasCacheBadge = item.has_cache
+                    ? '<span class="tag tag-green">已缓存</span>'
+                    : '<span class="tag tag-gray">未缓存</span>';
+
+                const updatedTime = item.cache_updated_at
+                    ? new Date(item.cache_updated_at).toLocaleString()
+                    : '-';
+                const lastSeenTime = item.last_seen_at
+                    ? new Date(item.last_seen_at).toLocaleString()
+                    : '-';
+
+                const actionBtn = item.is_default
+                    ? '<span class="text-sm text-muted">-</span>'
+                    : (canWriteUpstream
+                        ? `<button class="btn btn-danger btn-sm" data-cache-upstream="${escapeHtml(upstreamID)}" data-cache-ua="${escapeHtml(item.user_agent || '')}">删除</button>`
+                        : '<span class="text-sm text-muted">只读</span>');
+
+                return `
+                    <tr>
+                        <td>
+                            <div>${uaDisplay}</div>
+                            <div class="ua-cache-meta">更新: ${updatedTime}</div>
+                            <div class="ua-cache-meta">最近访问: ${lastSeenTime}</div>
+                        </td>
+                        <td>${hasCacheBadge}</td>
+                        <td>${item.total_requests || 0}</td>
+                        <td>${actionBtn}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function bindCacheDeleteButtons(root) {
+            root.querySelectorAll('[data-cache-upstream]').forEach(btn => {
+                btn.onclick = () => deleteUACacheVariant(btn.dataset.cacheUpstream, btn.dataset.cacheUa);
+            });
+        }
+
+        function initCacheUATable(upstream, idx, canWriteUpstream) {
+            const tableWrap = document.getElementById(`ua-cache-wrap-${idx}`);
+            const tbody = document.getElementById(`ua-cache-body-${idx}`);
+            const pageInfo = document.getElementById(`ua-cache-page-${idx}`);
+            const prevBtn = document.getElementById(`ua-cache-prev-${idx}`);
+            const nextBtn = document.getElementById(`ua-cache-next-${idx}`);
+            const keywordInput = document.getElementById(`ua-cache-search-${idx}`);
+            const pageSizeSelect = document.getElementById(`ua-cache-size-${idx}`);
+            const onlyCachedInput = document.getElementById(`ua-cache-only-cached-${idx}`);
+            const summary = document.getElementById(`ua-cache-summary-${idx}`);
+
+            if (!tableWrap || !tbody || !pageInfo || !prevBtn || !nextBtn || !keywordInput || !pageSizeSelect || !onlyCachedInput || !summary) {
+                return;
+            }
+
+            const source = sortUACacheStatuses(upstream.ua_cache_statuses || []);
+            let currentPage = 1;
+
+            const render = () => {
+                const keyword = (keywordInput.value || '').trim().toLowerCase();
+                const onlyCached = !!onlyCachedInput.checked;
+                const pageSize = Math.max(1, parseInt(pageSizeSelect.value || '20', 10));
+
+                const filtered = source.filter(item => {
+                    if (onlyCached && !item.has_cache) return false;
+                    if (!keyword) return true;
+                    const ua = String(item.user_agent || '').toLowerCase();
+                    const req = String(item.total_requests || 0);
+                    return ua.includes(keyword) || req.includes(keyword);
+                });
+
+                const total = filtered.length;
+                const totalPages = Math.max(1, Math.ceil(total / pageSize));
+                if (currentPage > totalPages) currentPage = totalPages;
+                if (currentPage < 1) currentPage = 1;
+
+                const start = (currentPage - 1) * pageSize;
+                const pageRows = filtered.slice(start, start + pageSize);
+
+                tbody.innerHTML = pageRows.length > 0
+                    ? renderCacheUARows(pageRows, upstream.id, canWriteUpstream)
+                    : '<tr><td colspan="4" class="text-muted" style="text-align:center; padding:0.85rem;">无匹配UA</td></tr>';
+
+                summary.textContent = `总 ${source.length} 条，筛选后 ${total} 条`;
+                pageInfo.textContent = `第 ${currentPage}/${totalPages} 页`;
+                prevBtn.disabled = currentPage <= 1;
+                nextBtn.disabled = currentPage >= totalPages;
+                bindCacheDeleteButtons(tableWrap);
+            };
+
+            const resetAndRender = () => {
+                currentPage = 1;
+                render();
+            };
+
+            keywordInput.oninput = resetAndRender;
+            pageSizeSelect.onchange = resetAndRender;
+            onlyCachedInput.onchange = resetAndRender;
+            prevBtn.onclick = () => {
+                currentPage -= 1;
+                render();
+            };
+            nextBtn.onclick = () => {
+                currentPage += 1;
+                render();
+            };
+
+            render();
+        }
+
         async function renderCache() {
             const content = $('#content-area');
             content.innerHTML = '<div class="text-muted">加载中...</div>';
@@ -1166,90 +1521,92 @@
                     <div class="card" style="padding: 0.85rem 1rem; margin-bottom: 1rem; font-size: 0.85rem; color: var(--text-muted);">
                         支持手动删除某个 UA 变体缓存。删除后会同时清理该 UA 的活跃刷新计划，避免被定时任务立即回填。
                     </div>
-                    <div class="dashboard-grid">
+                    <div class="cache-grid">
                 `;
 
                 if (cacheData.upstreams && cacheData.upstreams.length > 0) {
-                    cacheData.upstreams.forEach(u => {
+                    cacheData.upstreams.forEach((u, idx) => {
                         const strategyText = u.cache_strategy === 'force' ? '强制缓存' : '懒缓存';
                         const statusBadge = u.enabled 
                             ? '<span class="tag tag-green"><span class="tag-dot bg-success"></span>启用</span>'
                             : '<span class="tag tag-red"><span class="tag-dot bg-danger"></span>禁用</span>';
 
-                        const uaRows = (u.ua_cache_statuses || []).map(item => {
-                            const uaText = item.is_default ? '默认UA' : (item.user_agent || '-');
-                            const uaDisplay = item.is_default
-                                ? '<span class="tag tag-blue">默认UA</span>'
-                                : `<span title="${escapeHtml(uaText)}">${escapeHtml(uaText.length > 48 ? uaText.slice(0, 48) + '...' : uaText)}</span>`;
-                            
-                            const hasCacheBadge = item.has_cache 
-                                ? '<span class="tag tag-green">已缓存</span>' 
-                                : '<span class="tag tag-gray">未缓存</span>';
-                                
-                            const updatedTime = item.cache_updated_at 
-                                ? new Date(item.cache_updated_at).toLocaleString() 
-                                : '-';
-                            const lastSeenTime = item.last_seen_at
-                                ? new Date(item.last_seen_at).toLocaleString()
-                                : '-';
-                            const actionBtn = item.is_default
-                                ? '<span class="text-sm text-muted">-</span>'
-                                : (canWriteUpstream
-                                    ? `<button class="btn btn-danger btn-sm" data-cache-upstream="${escapeHtml(u.id)}" data-cache-ua="${escapeHtml(item.user_agent || '')}">删除</button>`
-                                    : '<span class="text-sm text-muted">只读</span>');
-                                
-                            return `
-                                <tr>
-                                    <td>
-                                        <div>${uaDisplay}</div>
-                                        <div class="text-sm text-muted" style="font-size: 0.75rem; margin-top: 2px;">
-                                            更新: ${updatedTime}
-                                        </div>
-                                    </td>
-                                    <td>${hasCacheBadge}</td>
-                                    <td>${item.total_requests || 0}</td>
-                                    <td>${actionBtn}</td>
-                                </tr>
-                            `;
-                        }).join('');
-
-                        const uaTableHtml = uaRows
+                        const uaCount = Array.isArray(u.ua_cache_statuses) ? u.ua_cache_statuses.length : 0;
+                        const defaultCount = (u.ua_cache_statuses || []).filter(item => item.is_default).length;
+                        const cachedCount = (u.ua_cache_statuses || []).filter(item => item.has_cache).length;
+                        const defaultPageSize = uaCount > 100 ? 50 : 20;
+                        const collapsedByDefault = uaCount > 40;
+                        const uaTableHtml = uaCount > 0
                             ? `
-                                <div class="table-container" style="margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 0.5rem;">
-                                    <div style="font-size:0.85rem; font-weight:600; margin-bottom:0.5rem;">UA 变体列表</div>
-                                    <table style="font-size: 0.8rem;">
-                                        <thead>
-                                            <tr><th>UA / 时间</th><th>状态</th><th>请求数</th><th>操作</th></tr>
-                                        </thead>
-                                        <tbody>${uaRows}</tbody>
-                                    </table>
+                                <div class="ua-cache-table-wrap" id="ua-cache-wrap-${idx}">
+                                    <div class="ua-toggle-row">
+                                        <div class="ua-toggle-tip">UA 变体列表（${uaCount}）</div>
+                                        <button class="btn btn-secondary btn-sm" data-ua-toggle="${idx}" data-expanded="${collapsedByDefault ? '0' : '1'}">${collapsedByDefault ? '展开列表' : '收起列表'}</button>
+                                    </div>
+                                    <div id="ua-cache-panel-${idx}" style="display:${collapsedByDefault ? 'none' : 'block'};">
+                                        <div class="ua-cache-toolbar">
+                                            <input id="ua-cache-search-${idx}" class="input" placeholder="筛选UA / 请求数">
+                                            <select id="ua-cache-size-${idx}" class="input" style="max-width: 130px;">
+                                                <option value="20" ${defaultPageSize === 20 ? 'selected' : ''}>20/页</option>
+                                                <option value="50" ${defaultPageSize === 50 ? 'selected' : ''}>50/页</option>
+                                                <option value="100">100/页</option>
+                                            </select>
+                                            <label class="text-sm" style="display:flex; align-items:center; gap:0.35rem;">
+                                                <input type="checkbox" id="ua-cache-only-cached-${idx}"> 仅已缓存
+                                            </label>
+                                            <span class="ua-cache-summary" id="ua-cache-summary-${idx}"></span>
+                                        </div>
+                                        <div class="table-container">
+                                            <table>
+                                                <thead>
+                                                    <tr><th>UA / 时间</th><th>状态</th><th>请求数</th><th>操作</th></tr>
+                                                </thead>
+                                                <tbody id="ua-cache-body-${idx}">
+                                                    <tr><td colspan="4" class="text-muted" style="text-align:center; padding:0.85rem;">加载中...</td></tr>
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                        <div class="flex items-center justify-between" style="margin-top:0.45rem; gap:0.5rem; flex-wrap: wrap;">
+                                            <span id="ua-cache-page-${idx}" class="text-sm text-muted">第 1/1 页</span>
+                                            <div class="dash-actions">
+                                                <button class="btn btn-secondary btn-sm" id="ua-cache-prev-${idx}">上一页</button>
+                                                <button class="btn btn-secondary btn-sm" id="ua-cache-next-${idx}">下一页</button>
+                                            </div>
+                                        </div>
+                                    </div>
                                 </div>
                               `
                             : '<div class="text-sm text-muted mt-4">暂无UA缓存统计</div>';
 
                         html += `
-                            <div class="dash-card">
+                            <div class="dash-card cache-card">
                                 <div class="dash-card-header">
-                                    <div class="dash-card-title">${escapeHtml(u.name || '未命名')}</div>
-                                    ${statusBadge}
+                                    <div class="cache-card-title-wrap">
+                                        <div class="dash-card-title">${escapeHtml(u.name || '未命名')}</div>
+                                        <div class="text-sm text-muted">更新于 ${u.cache_updated_at ? new Date(u.cache_updated_at).toLocaleString() : '从未更新'}</div>
+                                    </div>
+                                    <div class="dash-card-status">${statusBadge}</div>
                                 </div>
                                 <div class="dash-card-body">
-                                    <div class="dash-info-group">
-                                        <span class="dash-label">策略</span>
-                                        <span class="dash-value sm">${strategyText}</span>
-                                    </div>
-                                    <div class="dash-info-group">
-                                        <span class="dash-label">刷新周期</span>
-                                        <span class="dash-value sm">${escapeHtml(u.refresh_interval || '10m')}</span>
-                                    </div>
-                                    <div class="dash-info-group">
-                                        <span class="dash-label">变体数量</span>
-                                        <span class="dash-value sm">${u.cache_variants || 0}</span>
+                                    <div class="cache-summary-row">
+                                        <div class="cache-pill">
+                                            <span class="cache-pill-label">缓存策略</span>
+                                            <span class="cache-pill-value">${strategyText}</span>
+                                        </div>
+                                        <div class="cache-pill">
+                                            <span class="cache-pill-label">刷新周期</span>
+                                            <span class="cache-pill-value">${escapeHtml(u.refresh_interval || '10m')}</span>
+                                        </div>
+                                        <div class="cache-pill">
+                                            <span class="cache-pill-label">变体 / 已缓存</span>
+                                            <span class="cache-pill-value">${u.cache_variants || 0} / ${cachedCount}</span>
+                                        </div>
+                                        <div class="cache-pill">
+                                            <span class="cache-pill-label">默认UA</span>
+                                            <span class="cache-pill-value">${defaultCount}</span>
+                                        </div>
                                     </div>
                                     ${uaTableHtml}
-                                </div>
-                                <div class="dash-card-footer">
-                                    <span>更新于 ${u.cache_updated_at ? new Date(u.cache_updated_at).toLocaleString() : '从未更新'}</span>
                                 </div>
                             </div>
                         `;
@@ -1260,8 +1617,26 @@
 
                 html += '</div>';
                 content.innerHTML = html;
-                content.querySelectorAll('[data-cache-upstream]').forEach(btn => {
-                    btn.onclick = () => deleteUACacheVariant(btn.dataset.cacheUpstream, btn.dataset.cacheUa);
+                bindCacheDeleteButtons(content);
+                (cacheData.upstreams || []).forEach((u, idx) => {
+                    initCacheUATable(u, idx, canWriteUpstream);
+                });
+                content.querySelectorAll('[data-ua-toggle]').forEach(btn => {
+                    btn.onclick = () => {
+                        const idx = btn.dataset.uaToggle;
+                        const panel = document.getElementById(`ua-cache-panel-${idx}`);
+                        if (!panel) return;
+                        const expanded = btn.dataset.expanded === '1';
+                        if (expanded) {
+                            panel.style.display = 'none';
+                            btn.dataset.expanded = '0';
+                            btn.textContent = '展开列表';
+                        } else {
+                            panel.style.display = 'block';
+                            btn.dataset.expanded = '1';
+                            btn.textContent = '收起列表';
+                        }
+                    };
                 });
             } catch (e) {
                 content.innerHTML = '<div class="text-danger">加载失败: ' + escapeHtml(e.message) + '</div>';
