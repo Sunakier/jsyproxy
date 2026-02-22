@@ -627,6 +627,32 @@ func (h *SubscribeHandler) AdminDedupeUpstreamCache(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "removed": removed, "remain": remain})
 }
 
+func (h *SubscribeHandler) AdminDeleteUpstreamUACache(c *gin.Context) {
+	upstreamID := strings.TrimSpace(c.Param("id"))
+	userAgent := strings.TrimSpace(c.Query("ua"))
+	if userAgent == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少ua参数"})
+		return
+	}
+
+	removedCache, removedPlan, variantKey, err := h.state.DeleteUACacheVariant(upstreamID, userAgent)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if !removedCache && !removedPlan {
+		c.JSON(http.StatusNotFound, gin.H{"error": "未找到对应UA缓存"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":            true,
+		"variant":       variantKey,
+		"removed_cache": removedCache,
+		"removed_plan":  removedPlan,
+	})
+}
+
 func (h *SubscribeHandler) AdminGetSettings(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"global_config": h.state.GetGlobalConfig(),

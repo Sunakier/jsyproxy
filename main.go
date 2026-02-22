@@ -53,6 +53,7 @@ func main() {
 		adminAPI.DELETE("/upstreams/:id", subscribeHandler.AdminDeleteUpstream)
 		adminAPI.POST("/upstreams/:id/refresh", subscribeHandler.AdminRefreshUpstream)
 		adminAPI.POST("/upstreams/:id/dedupe", subscribeHandler.AdminDedupeUpstreamCache)
+		adminAPI.DELETE("/upstreams/:id/ua-cache", subscribeHandler.AdminDeleteUpstreamUACache)
 
 		adminAPI.GET("/keys", subscribeHandler.AdminListKeys)
 		adminAPI.POST("/keys", subscribeHandler.AdminAddKey)

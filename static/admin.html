@@ -286,6 +286,25 @@
             display: flex;
             gap: 0.25rem;
         }
+        .log-help {
+            margin: 0 1.25rem 1rem;
+            padding: 0.85rem 1rem;
+            border: 1px dashed var(--border);
+            border-radius: var(--radius);
+            background: var(--bg-body);
+            color: var(--text-muted);
+            font-size: 0.82rem;
+            line-height: 1.6;
+        }
+        .log-help strong { color: var(--text-main); }
+        .log-ua {
+            max-width: 360px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            display: inline-block;
+            vertical-align: middle;
+        }
     </style>
 </head>
 <body>
@@ -548,6 +567,9 @@
                         <h3>上游缓存详情</h3>
                         <button class="btn btn-secondary btn-sm" onclick="renderCache()">↻ 刷新</button>
                     </div>
+                    <div class="card" style="padding: 0.85rem 1rem; margin-bottom: 1rem; font-size: 0.85rem; color: var(--text-muted);">
+                        支持手动删除某个 UA 变体缓存。删除后会同时清理该 UA 的活跃刷新计划，避免被定时任务立即回填。
+                    </div>
                     <div class="dashboard-grid">
                 `;
 
@@ -574,6 +596,9 @@
                             const lastSeenTime = item.last_seen_at
                                 ? new Date(item.last_seen_at).toLocaleString()
                                 : '-';
+                            const actionBtn = item.is_default
+                                ? '<span class="text-sm text-muted">-</span>'
+                                : `<button class="btn btn-danger btn-sm" data-cache-upstream="${escapeHtml(u.id)}" data-cache-ua="${escapeHtml(item.user_agent || '')}">删除</button>`;
                                 
                             return `
                                 <tr>
@@ -585,6 +610,7 @@
                                     </td>
                                     <td>${hasCacheBadge}</td>
                                     <td>${item.total_requests || 0}</td>
+                                    <td>${actionBtn}</td>
                                 </tr>
                             `;
                         }).join('');
@@ -595,7 +621,7 @@
                                     <div style="font-size:0.85rem; font-weight:600; margin-bottom:0.5rem;">UA 变体列表</div>
                                     <table style="font-size: 0.8rem;">
                                         <thead>
-                                            <tr><th>UA / 时间</th><th>状态</th><th>请求数</th></tr>
+                                            <tr><th>UA / 时间</th><th>状态</th><th>请求数</th><th>操作</th></tr>
                                         </thead>
                                         <tbody>${uaRows}</tbody>
                                     </table>
@@ -636,8 +662,29 @@
 
                 html += '</div>';
                 content.innerHTML = html;
+                content.querySelectorAll('[data-cache-upstream]').forEach(btn => {
+                    btn.onclick = () => deleteUACacheVariant(btn.dataset.cacheUpstream, btn.dataset.cacheUa);
+                });
             } catch (e) {
                 content.innerHTML = '<div class="text-danger">加载失败: ' + escapeHtml(e.message) + '</div>';
+            }
+        }
+
+        async function deleteUACacheVariant(upstreamID, userAgent) {
+            if (!upstreamID || !userAgent) {
+                showToast('缺少必要参数，无法删除UA缓存', 'error');
+                return;
+            }
+            const shortUA = userAgent.length > 40 ? (userAgent.slice(0, 40) + '...') : userAgent;
+            if (!confirm(`确定删除该UA缓存吗？\n${shortUA}`)) return;
+            try {
+                const result = await api('/upstreams/' + encodeURIComponent(upstreamID) + '/ua-cache?ua=' + encodeURIComponent(userAgent), { method: 'DELETE' });
+                const removedCache = result.removed_cache ? '缓存已删' : '缓存不存在';
+                const removedPlan = result.removed_plan ? '计划已清理' : '计划不存在';
+                showToast(`删除完成：${removedCache}，${removedPlan}`, 'success');
+                renderCache();
+            } catch (e) {
+                showToast(e.message, 'error');
             }
         }
 
@@ -1190,38 +1237,50 @@
                 let html = `
                     <div class="dash-card">
                         <div class="dash-card-header">
-                            <div class="dash-card-title">Access Logs</div>
+                            <div class="dash-card-title">访问日志</div>
+                        </div>
+                        <div class="log-help">
+                            <div><strong>说明：</strong>每条日志记录一次客户端拉取请求，包含 <strong>原始UA</strong>、<strong>命中规则(ua_rule)</strong>、<strong>变体(ua_variant)</strong>、<strong>家族/缓存桶(ua_family)</strong>。</div>
+                            <div>规则与家族来自「全局设置 → UA归一化规则」。家族一致表示会命中同一缓存变体。</div>
                         </div>
                         <div class="dash-card-body" style="padding:0;">
                             <div class="table-container">
                                 <table>
                                     <thead>
-                                        <tr><th>Time</th><th>Key</th><th>IP</th><th>UA</th><th>Rule</th><th>Variant</th><th>Family</th><th>Cache</th><th>Status</th><th>Message</th></tr>
+                                        <tr><th>时间</th><th>Key</th><th>IP</th><th>客户端UA</th><th>命中规则</th><th>变体</th><th>家族</th><th>缓存</th><th>结果</th><th>备注</th></tr>
                                     </thead>
                                     <tbody>
                 `;
                 
                 if (logs.length === 0) {
-                    html += '<tr><td colspan="10" class="text-muted" style="text-align:center; padding: 2rem;">No logs available</td></tr>';
+                    html += '<tr><td colspan="10" class="text-muted" style="text-align:center; padding: 2rem;">暂无访问日志</td></tr>';
                 } else {
                     logs.forEach(l => {
                         const cacheHit = l.cache_hit 
                             ? '<span class="tag tag-green">HIT</span>' 
                             : '<span class="tag tag-gray">MISS</span>';
                         const statusBadge = l.status === 'success' 
-                            ? '<span class="tag tag-green">200</span>' 
-                            : '<span class="tag tag-red">ERR</span>';
+                            ? '<span class="tag tag-green">成功</span>' 
+                            : '<span class="tag tag-red">失败</span>';
                         const keyDisplay = l.key_name || l.key || '-';
+                        const ruleTextMap = {
+                            default: '默认',
+                            unknown: '未知',
+                            passthrough: '透传',
+                            normalization_disabled: '未启用归一化'
+                        };
+                        const ruleText = ruleTextMap[l.ua_rule] || l.ua_rule || '-';
+                        const familyText = l.ua_family || l.cache_bucket || '-';
                         
                         html += `
                             <tr>
                                 <td class="text-sm">${l.time ? new Date(l.time).toLocaleString() : '-'}</td>
                                 <td class="text-sm"><strong>${escapeHtml(keyDisplay)}</strong></td>
                                 <td class="text-sm"><span class="code-box">${escapeHtml(l.client_ip || '-')}</span></td>
-                                <td class="text-sm"><span class="code-box">${escapeHtml(l.user_agent || '-')}</span></td>
-                                <td class="text-sm">${escapeHtml(l.ua_rule || '-')}</td>
+                                <td class="text-sm"><span class="code-box log-ua" title="${escapeHtml(l.user_agent || '')}">${escapeHtml(l.user_agent || '-')}</span></td>
+                                <td class="text-sm">${escapeHtml(ruleText)}</td>
                                 <td class="text-sm">${escapeHtml(l.ua_variant || '-')}</td>
-                                <td class="text-sm">${escapeHtml(l.ua_family || l.cache_bucket || '-')}</td>
+                                <td class="text-sm">${escapeHtml(familyText)}</td>
                                 <td>${cacheHit}</td>
                                 <td>${statusBadge}</td>
                                 <td class="text-sm">${escapeHtml(l.message || '-')}</td>
@@ -1237,9 +1296,9 @@
                         </div>
                         <div class="dash-card-footer" style="justify-content: center;">
                             <div class="pagination">
-                                <button class="btn btn-secondary btn-sm" onclick="loadLogPage(${page - 1})" ${page <= 1 ? 'disabled' : ''}>Previous</button>
-                                <span class="text-sm text-muted">Page ${data.page || 1} of ${data.total_pages || 1} (${data.total_count || 0} items)</span>
-                                <button class="btn btn-secondary btn-sm" onclick="loadLogPage(${page + 1})" ${page >= (data.total_pages || 1) ? 'disabled' : ''}>Next</button>
+                                <button class="btn btn-secondary btn-sm" onclick="loadLogPage(${page - 1})" ${page <= 1 ? 'disabled' : ''}>上一页</button>
+                                <span class="text-sm text-muted">第 ${data.page || 1} / ${data.total_pages || 1} 页，共 ${data.total_count || 0} 条</span>
+                                <button class="btn btn-secondary btn-sm" onclick="loadLogPage(${page + 1})" ${page >= (data.total_pages || 1) ? 'disabled' : ''}>下一页</button>
                             </div>
                         </div>
                     </div>

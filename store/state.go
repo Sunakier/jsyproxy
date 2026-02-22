@@ -841,6 +841,48 @@ func (s *State) DedupeCacheVariants(upstreamID string) (int, int) {
 	return removed, len(bucket)
 }
 
+func (s *State) DeleteUACacheVariant(upstreamID, userAgent string) (bool, bool, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if strings.TrimSpace(upstreamID) == "" {
+		return false, false, "", errors.New("upstream不能为空")
+	}
+	if _, ok := s.upstreams[upstreamID]; !ok {
+		return false, false, "", errors.New("上游不存在")
+	}
+
+	variantKey := s.normalizeUAVariantLocked(userAgent)
+	if variantKey == cacheVariantDefault {
+		return false, false, variantKey, errors.New("默认UA缓存不支持删除")
+	}
+
+	removedCache := false
+	if bucket, ok := s.caches[upstreamID]; ok && bucket != nil {
+		if _, exists := bucket[variantKey]; exists {
+			delete(bucket, variantKey)
+			removedCache = true
+		}
+	}
+
+	removedPlan := false
+	if seenMap, ok := s.uaSeen[upstreamID]; ok && seenMap != nil {
+		if _, exists := seenMap[variantKey]; exists {
+			delete(seenMap, variantKey)
+			removedPlan = true
+		}
+	}
+
+	if !removedCache && !removedPlan {
+		return false, false, variantKey, nil
+	}
+
+	if err := s.saveLocked(); err != nil {
+		return false, false, variantKey, err
+	}
+	return removedCache, removedPlan, variantKey, nil
+}
+
 func cacheContentHash(cache *CachedSubscription) string {
 	if cache == nil {
 		return ""
