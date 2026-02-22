@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
 )
 
 const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
@@ -27,6 +28,20 @@ const (
 	maxTrackedUAVariants        = 100
 	maxCacheVariantsPerUpstream = maxTrackedUAVariants + 1
 	defaultActiveUADays         = 30
+	AdminRoleSuperAdmin         = "super_admin"
+	AdminRoleOperator           = "operator"
+	AdminRoleViewer             = "viewer"
+	PermissionAdminRead         = "admin.read"
+	PermissionAdminWrite        = "admin.write"
+	PermissionSettingsWrite     = "settings.write"
+	PermissionUpstreamRead      = "upstream.read"
+	PermissionUpstreamWrite     = "upstream.write"
+	PermissionKeyRead           = "key.read"
+	PermissionKeyWrite          = "key.write"
+	PermissionLogRead           = "log.read"
+	PermissionUserManage        = "user.manage"
+	UpstreamScopeModeAll        = "all"
+	UpstreamScopeModeSelected   = "selected"
 )
 
 type Upstream struct {
@@ -129,9 +144,30 @@ type UACacheStatus struct {
 	MonthRequests  int        `json:"month_requests"`
 }
 
+type AdminUser struct {
+	ID                string    `json:"id"`
+	Username          string    `json:"username"`
+	PasswordHash      string    `json:"password_hash"`
+	Role              string    `json:"role"`
+	CustomPermissions []string  `json:"custom_permissions,omitempty"`
+	UpstreamScopeMode string    `json:"upstream_scope_mode,omitempty"`
+	UpstreamScopeIDs  []string  `json:"upstream_scope_ids,omitempty"`
+	Enabled           bool      `json:"enabled"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+type AdminSession struct {
+	UserID    string
+	Username  string
+	Role      string
+	ExpiresAt time.Time
+}
+
 type persistedState struct {
 	Upstreams []Upstream                  `json:"upstreams"`
 	Keys      []AccessKey                 `json:"keys"`
+	Users     []AdminUser                 `json:"users,omitempty"`
 	Logs      []ClientUpdateLog           `json:"logs"`
 	Config    GlobalConfig                `json:"config"`
 	UASeen    map[string]map[string]int64 `json:"ua_seen,omitempty"`
@@ -139,29 +175,33 @@ type persistedState struct {
 }
 
 type State struct {
-	mu            sync.RWMutex
-	upstreams     map[string]Upstream
-	keys          map[string]AccessKey
-	keysByToken   map[string]string
-	logs          []ClientUpdateLog
-	caches        map[string]map[string]*CachedSubscription
-	uaSeen        map[string]map[string]time.Time
-	config        GlobalConfig
-	adminSessions map[string]time.Time
-	dataFile      string
+	mu              sync.RWMutex
+	upstreams       map[string]Upstream
+	keys            map[string]AccessKey
+	keysByToken     map[string]string
+	logs            []ClientUpdateLog
+	caches          map[string]map[string]*CachedSubscription
+	uaSeen          map[string]map[string]time.Time
+	config          GlobalConfig
+	adminUsers      map[string]AdminUser
+	adminUserByName map[string]string
+	adminSessions   map[string]AdminSession
+	dataFile        string
 }
 
-func New(dataFile string, initialKeys []string, defaultRefreshInterval string) (*State, error) {
+func New(dataFile string, initialKeys []string, defaultRefreshInterval, adminUsername, adminPassword string) (*State, error) {
 	s := &State{
-		upstreams:     make(map[string]Upstream),
-		keys:          make(map[string]AccessKey),
-		keysByToken:   make(map[string]string),
-		logs:          make([]ClientUpdateLog, 0),
-		caches:        make(map[string]map[string]*CachedSubscription),
-		uaSeen:        make(map[string]map[string]time.Time),
-		adminSessions: make(map[string]time.Time),
-		dataFile:      dataFile,
-		config:        GlobalConfig{ActiveUADays: defaultActiveUADays, UANormalization: defaultUANormalizationConfig()},
+		upstreams:       make(map[string]Upstream),
+		keys:            make(map[string]AccessKey),
+		keysByToken:     make(map[string]string),
+		logs:            make([]ClientUpdateLog, 0),
+		caches:          make(map[string]map[string]*CachedSubscription),
+		uaSeen:          make(map[string]map[string]time.Time),
+		adminUsers:      make(map[string]AdminUser),
+		adminUserByName: make(map[string]string),
+		adminSessions:   make(map[string]AdminSession),
+		dataFile:        dataFile,
+		config:          GlobalConfig{ActiveUADays: defaultActiveUADays, UANormalization: defaultUANormalizationConfig()},
 	}
 
 	if err := s.load(); err != nil {
@@ -209,6 +249,10 @@ func New(dataFile string, initialKeys []string, defaultRefreshInterval string) (
 		}
 		s.keys[keyID] = newKey
 		s.keysByToken[keyToken] = keyID
+	}
+
+	if err := s.ensureBootstrapAdminLocked(adminUsername, adminPassword); err != nil {
+		return nil, err
 	}
 
 	if err := s.saveLocked(); err != nil {
@@ -322,6 +366,584 @@ func (s *State) DeleteKey(keyID string) error {
 	}
 	delete(s.keys, keyID)
 	delete(s.keysByToken, key.Key)
+	return s.saveLocked()
+}
+
+func (s *State) ListAdminUsers() []AdminUser {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	list := make([]AdminUser, 0, len(s.adminUsers))
+	for _, user := range s.adminUsers {
+		list = append(list, user)
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].CreatedAt.Before(list[j].CreatedAt) })
+	return list
+}
+
+func normalizeAdminRole(role string) string {
+	switch strings.TrimSpace(role) {
+	case AdminRoleSuperAdmin:
+		return AdminRoleSuperAdmin
+	case AdminRoleOperator:
+		return AdminRoleOperator
+	case AdminRoleViewer:
+		return AdminRoleViewer
+	default:
+		return ""
+	}
+}
+
+func permissionsByRole(role string) map[string]struct{} {
+	switch role {
+	case AdminRoleSuperAdmin:
+		return map[string]struct{}{
+			PermissionAdminRead:     {},
+			PermissionAdminWrite:    {},
+			PermissionSettingsWrite: {},
+			PermissionUpstreamRead:  {},
+			PermissionUpstreamWrite: {},
+			PermissionKeyRead:       {},
+			PermissionKeyWrite:      {},
+			PermissionLogRead:       {},
+			PermissionUserManage:    {},
+		}
+	case AdminRoleOperator:
+		return map[string]struct{}{
+			PermissionAdminRead:     {},
+			PermissionAdminWrite:    {},
+			PermissionSettingsWrite: {},
+			PermissionUpstreamRead:  {},
+			PermissionUpstreamWrite: {},
+			PermissionKeyRead:       {},
+			PermissionKeyWrite:      {},
+			PermissionLogRead:       {},
+		}
+	case AdminRoleViewer:
+		return map[string]struct{}{
+			PermissionAdminRead:    {},
+			PermissionUpstreamRead: {},
+			PermissionKeyRead:      {},
+			PermissionLogRead:      {},
+		}
+	default:
+		return map[string]struct{}{}
+	}
+}
+
+func normalizePermission(permission string) string {
+	return strings.TrimSpace(permission)
+}
+
+func allPermissionSet() map[string]struct{} {
+	return map[string]struct{}{
+		PermissionAdminRead:     {},
+		PermissionAdminWrite:    {},
+		PermissionSettingsWrite: {},
+		PermissionUpstreamRead:  {},
+		PermissionUpstreamWrite: {},
+		PermissionKeyRead:       {},
+		PermissionKeyWrite:      {},
+		PermissionLogRead:       {},
+		PermissionUserManage:    {},
+	}
+}
+
+func normalizeCustomPermissions(permissions []string) []string {
+	if len(permissions) == 0 {
+		return nil
+	}
+	known := allPermissionSet()
+	seen := make(map[string]struct{}, len(permissions))
+	result := make([]string, 0, len(permissions))
+	for _, permission := range permissions {
+		normalized := normalizePermission(permission)
+		if normalized == "" {
+			continue
+		}
+		if _, ok := known[normalized]; !ok {
+			continue
+		}
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		result = append(result, normalized)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	sort.Strings(result)
+	return result
+}
+
+func normalizeUpstreamScopeMode(mode string) string {
+	switch strings.TrimSpace(mode) {
+	case UpstreamScopeModeAll:
+		return UpstreamScopeModeAll
+	case UpstreamScopeModeSelected:
+		return UpstreamScopeModeSelected
+	default:
+		return ""
+	}
+}
+
+func normalizeUpstreamScopeIDs(ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(ids))
+	result := make([]string, 0, len(ids))
+	for _, id := range ids {
+		normalized := strings.TrimSpace(id)
+		if normalized == "" {
+			continue
+		}
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		result = append(result, normalized)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	sort.Strings(result)
+	return result
+}
+
+func (s *State) normalizeAndValidateScopeLocked(mode string, ids []string) (string, []string, error) {
+	normalizedMode := normalizeUpstreamScopeMode(mode)
+	if normalizedMode == "" {
+		normalizedMode = UpstreamScopeModeAll
+	}
+	if normalizedMode == UpstreamScopeModeAll {
+		return UpstreamScopeModeAll, nil, nil
+	}
+	normalizedIDs := normalizeUpstreamScopeIDs(ids)
+	if len(normalizedIDs) == 0 {
+		return "", nil, errors.New("指定上游范围模式时，至少选择一个上游")
+	}
+	for _, upstreamID := range normalizedIDs {
+		if _, ok := s.upstreams[upstreamID]; !ok {
+			return "", nil, errors.New("用户上游范围包含不存在的上游")
+		}
+	}
+	return UpstreamScopeModeSelected, normalizedIDs, nil
+}
+
+func effectivePermissionsByUser(role string, custom []string) map[string]struct{} {
+	result := permissionsByRole(normalizeAdminRole(role))
+	for _, permission := range normalizeCustomPermissions(custom) {
+		result[permission] = struct{}{}
+	}
+	return result
+}
+
+func (s *State) HasPermission(userID, role, permission string) bool {
+	normalizedPermission := normalizePermission(permission)
+	if normalizedPermission == "" {
+		return false
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if user, ok := s.adminUsers[userID]; ok {
+		permissions := effectivePermissionsByUser(user.Role, user.CustomPermissions)
+		_, exists := permissions[normalizedPermission]
+		return exists
+	}
+	permissions := permissionsByRole(normalizeAdminRole(role))
+	_, exists := permissions[normalizedPermission]
+	return exists
+}
+
+func (s *State) UserCanAccessUpstream(userID, upstreamID string) bool {
+	normalizedUpstreamID := strings.TrimSpace(upstreamID)
+	if normalizedUpstreamID == "" {
+		return false
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	user, ok := s.adminUsers[userID]
+	if !ok || !user.Enabled {
+		return false
+	}
+	mode := normalizeUpstreamScopeMode(user.UpstreamScopeMode)
+	if mode == "" || mode == UpstreamScopeModeAll {
+		return true
+	}
+	for _, id := range user.UpstreamScopeIDs {
+		if id == normalizedUpstreamID {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *State) UserAllowedUpstreamIDs(userID string) map[string]struct{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	user, ok := s.adminUsers[userID]
+	if !ok || !user.Enabled {
+		return map[string]struct{}{}
+	}
+	mode := normalizeUpstreamScopeMode(user.UpstreamScopeMode)
+	if mode == "" || mode == UpstreamScopeModeAll {
+		result := make(map[string]struct{}, len(s.upstreams))
+		for id := range s.upstreams {
+			result[id] = struct{}{}
+		}
+		return result
+	}
+	result := make(map[string]struct{}, len(user.UpstreamScopeIDs))
+	for _, id := range user.UpstreamScopeIDs {
+		if _, ok := s.upstreams[id]; ok {
+			result[id] = struct{}{}
+		}
+	}
+	return result
+}
+
+func sortedPermissionsFromSet(set map[string]struct{}) []string {
+	if len(set) == 0 {
+		return nil
+	}
+	list := make([]string, 0, len(set))
+	for permission := range set {
+		list = append(list, permission)
+	}
+	sort.Strings(list)
+	return list
+}
+
+func RolePresetPermissions(role string) []string {
+	return sortedPermissionsFromSet(permissionsByRole(normalizeAdminRole(role)))
+}
+
+func AllPermissions() []string {
+	return sortedPermissionsFromSet(allPermissionSet())
+}
+
+func (s *State) GetAdminUser(userID string) (AdminUser, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	user, ok := s.adminUsers[strings.TrimSpace(userID)]
+	return user, ok
+}
+
+func (s *State) EffectivePermissions(userID string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	user, ok := s.adminUsers[strings.TrimSpace(userID)]
+	if !ok {
+		return nil
+	}
+	return sortedPermissionsFromSet(effectivePermissionsByUser(user.Role, user.CustomPermissions))
+}
+
+func normalizeAdminUsername(username string) string {
+	return strings.ToLower(strings.TrimSpace(username))
+}
+
+func hashPassword(password string) (string, error) {
+	hashed, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+	return string(hashed), nil
+}
+
+func verifyPassword(passwordHash, password string) bool {
+	if strings.TrimSpace(passwordHash) == "" {
+		return false
+	}
+	return bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(password)) == nil
+}
+
+func (s *State) ensureBootstrapAdminLocked(adminUsername, adminPassword string) error {
+	if len(s.adminUsers) > 0 {
+		return nil
+	}
+	username := normalizeAdminUsername(adminUsername)
+	if username == "" {
+		username = "admin"
+	}
+	if strings.TrimSpace(adminPassword) == "" {
+		return errors.New("管理员密码不能为空")
+	}
+	passwordHash, err := hashPassword(adminPassword)
+	if err != nil {
+		return fmt.Errorf("初始化管理员密码失败: %w", err)
+	}
+	now := time.Now()
+	user := AdminUser{
+		ID:                uuid.New().String(),
+		Username:          username,
+		PasswordHash:      passwordHash,
+		Role:              AdminRoleSuperAdmin,
+		CustomPermissions: nil,
+		UpstreamScopeMode: UpstreamScopeModeAll,
+		UpstreamScopeIDs:  nil,
+		Enabled:           true,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+	s.adminUsers[user.ID] = user
+	s.adminUserByName[user.Username] = user.ID
+	return nil
+}
+
+func (s *State) AuthenticateAdminUser(username, password string) (AdminUser, error) {
+	normalizedUsername := normalizeAdminUsername(username)
+	if normalizedUsername == "" || strings.TrimSpace(password) == "" {
+		return AdminUser{}, errors.New("用户名或密码错误")
+	}
+
+	s.mu.RLock()
+	userID, ok := s.adminUserByName[normalizedUsername]
+	if !ok {
+		s.mu.RUnlock()
+		return AdminUser{}, errors.New("用户名或密码错误")
+	}
+	user, exists := s.adminUsers[userID]
+	s.mu.RUnlock()
+	if !exists || !user.Enabled {
+		return AdminUser{}, errors.New("用户已禁用")
+	}
+	if !verifyPassword(user.PasswordHash, password) {
+		return AdminUser{}, errors.New("用户名或密码错误")
+	}
+	return user, nil
+}
+
+func (s *State) CreateAdminSession(userID string) (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(buf)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	user, ok := s.adminUsers[userID]
+	if !ok || !user.Enabled {
+		return "", errors.New("用户不存在或已禁用")
+	}
+
+	s.adminSessions[token] = AdminSession{
+		UserID:    user.ID,
+		Username:  user.Username,
+		Role:      user.Role,
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	}
+	return token, nil
+}
+
+func (s *State) ValidateAdminSession(token string) (AdminSession, bool) {
+	if token == "" {
+		return AdminSession{}, false
+	}
+
+	s.mu.RLock()
+	session, ok := s.adminSessions[token]
+	s.mu.RUnlock()
+	if !ok || time.Now().After(session.ExpiresAt) {
+		if ok {
+			s.mu.Lock()
+			delete(s.adminSessions, token)
+			s.mu.Unlock()
+		}
+		return AdminSession{}, false
+	}
+
+	s.mu.RLock()
+	user, exists := s.adminUsers[session.UserID]
+	s.mu.RUnlock()
+	if !exists || !user.Enabled {
+		s.mu.Lock()
+		delete(s.adminSessions, token)
+		s.mu.Unlock()
+		return AdminSession{}, false
+	}
+
+	session.Username = user.Username
+	session.Role = user.Role
+	return session, true
+}
+
+func (s *State) DeleteAdminSession(token string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.adminSessions, token)
+}
+
+func (s *State) enabledSuperAdminCountLocked() int {
+	count := 0
+	for _, user := range s.adminUsers {
+		if user.Enabled && user.Role == AdminRoleSuperAdmin {
+			count++
+		}
+	}
+	return count
+}
+
+func (s *State) AddAdminUser(username, password, role string, customPermissions []string, upstreamScopeMode string, upstreamScopeIDs []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	username = normalizeAdminUsername(username)
+	if username == "" {
+		return errors.New("用户名不能为空")
+	}
+	if strings.TrimSpace(password) == "" {
+		return errors.New("密码不能为空")
+	}
+	role = normalizeAdminRole(role)
+	if role == "" {
+		return errors.New("无效的角色")
+	}
+	normalizedPermissions := normalizeCustomPermissions(customPermissions)
+	normalizedScopeMode, normalizedScopeIDs, err := s.normalizeAndValidateScopeLocked(upstreamScopeMode, upstreamScopeIDs)
+	if err != nil {
+		return err
+	}
+	if _, exists := s.adminUserByName[username]; exists {
+		return errors.New("用户名已存在")
+	}
+
+	passwordHash, err := hashPassword(password)
+	if err != nil {
+		return fmt.Errorf("生成密码失败: %w", err)
+	}
+	now := time.Now()
+	user := AdminUser{
+		ID:                uuid.New().String(),
+		Username:          username,
+		PasswordHash:      passwordHash,
+		Role:              role,
+		CustomPermissions: normalizedPermissions,
+		UpstreamScopeMode: normalizedScopeMode,
+		UpstreamScopeIDs:  normalizedScopeIDs,
+		Enabled:           true,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+	s.adminUsers[user.ID] = user
+	s.adminUserByName[user.Username] = user.ID
+	return s.saveLocked()
+}
+
+func (s *State) UpdateAdminUser(userID, username, role string, enabled bool, customPermissions []string, upstreamScopeMode string, upstreamScopeIDs []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	user, ok := s.adminUsers[userID]
+	if !ok {
+		return errors.New("用户不存在")
+	}
+
+	normalizedUsername := normalizeAdminUsername(username)
+	if normalizedUsername == "" {
+		return errors.New("用户名不能为空")
+	}
+	if existingID, exists := s.adminUserByName[normalizedUsername]; exists && existingID != userID {
+		return errors.New("用户名已存在")
+	}
+
+	normalizedRole := normalizeAdminRole(role)
+	if normalizedRole == "" {
+		return errors.New("无效的角色")
+	}
+	normalizedPermissions := normalizeCustomPermissions(customPermissions)
+	normalizedScopeMode, normalizedScopeIDs, err := s.normalizeAndValidateScopeLocked(upstreamScopeMode, upstreamScopeIDs)
+	if err != nil {
+		return err
+	}
+
+	if user.Role == AdminRoleSuperAdmin && (!enabled || normalizedRole != AdminRoleSuperAdmin) {
+		if s.enabledSuperAdminCountLocked() <= 1 {
+			return errors.New("至少保留一个启用的超级管理员")
+		}
+	}
+
+	delete(s.adminUserByName, user.Username)
+	user.Username = normalizedUsername
+	user.Role = normalizedRole
+	user.CustomPermissions = normalizedPermissions
+	user.UpstreamScopeMode = normalizedScopeMode
+	user.UpstreamScopeIDs = normalizedScopeIDs
+	user.Enabled = enabled
+	user.UpdatedAt = time.Now()
+	s.adminUsers[userID] = user
+	s.adminUserByName[user.Username] = userID
+
+	for token, session := range s.adminSessions {
+		if session.UserID != userID {
+			continue
+		}
+		if !enabled {
+			delete(s.adminSessions, token)
+			continue
+		}
+		session.Username = user.Username
+		session.Role = user.Role
+		s.adminSessions[token] = session
+	}
+
+	return s.saveLocked()
+}
+
+func (s *State) UpdateAdminUserPassword(userID, newPassword string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	user, ok := s.adminUsers[userID]
+	if !ok {
+		return errors.New("用户不存在")
+	}
+	if strings.TrimSpace(newPassword) == "" {
+		return errors.New("密码不能为空")
+	}
+	hash, err := hashPassword(newPassword)
+	if err != nil {
+		return fmt.Errorf("更新密码失败: %w", err)
+	}
+	user.PasswordHash = hash
+	user.UpdatedAt = time.Now()
+	s.adminUsers[userID] = user
+
+	for token, session := range s.adminSessions {
+		if session.UserID == userID {
+			delete(s.adminSessions, token)
+		}
+	}
+
+	return s.saveLocked()
+}
+
+func (s *State) DeleteAdminUser(userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	user, ok := s.adminUsers[userID]
+	if !ok {
+		return errors.New("用户不存在")
+	}
+	if user.Role == AdminRoleSuperAdmin && user.Enabled && s.enabledSuperAdminCountLocked() <= 1 {
+		return errors.New("至少保留一个启用的超级管理员")
+	}
+
+	delete(s.adminUsers, userID)
+	delete(s.adminUserByName, user.Username)
+	for token, session := range s.adminSessions {
+		if session.UserID == userID {
+			delete(s.adminSessions, token)
+		}
+	}
+
 	return s.saveLocked()
 }
 
@@ -978,6 +1600,58 @@ func (s *State) ListLogsPaginated(page, pageSize int) LogPage {
 	}
 }
 
+func (s *State) ListLogsPaginatedByUpstreamScope(page, pageSize int, allowedUpstreamIDs map[string]struct{}) LogPage {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 50
+	}
+	if pageSize > 500 {
+		pageSize = 500
+	}
+
+	filtered := make([]ClientUpdateLog, 0, len(s.logs))
+	for i := len(s.logs) - 1; i >= 0; i-- {
+		entry := s.logs[i]
+		if _, ok := allowedUpstreamIDs[entry.UpstreamID]; !ok {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+
+	total := len(filtered)
+	totalPages := (total + pageSize - 1) / pageSize
+	if totalPages < 1 {
+		totalPages = 1
+	}
+
+	startIdx := (page - 1) * pageSize
+	if startIdx > total {
+		startIdx = total
+	}
+	endIdx := startIdx + pageSize
+	if endIdx > total {
+		endIdx = total
+	}
+
+	result := make([]ClientUpdateLog, 0, endIdx-startIdx)
+	for _, entry := range filtered[startIdx:endIdx] {
+		result = append(result, entry)
+	}
+
+	return LogPage{
+		Logs:       result,
+		Page:       page,
+		PageSize:   pageSize,
+		TotalCount: total,
+		TotalPages: totalPages,
+	}
+}
+
 func (s *State) ListLogs(limit int) []ClientUpdateLog {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -987,6 +1661,23 @@ func (s *State) ListLogs(limit int) []ClientUpdateLog {
 	result := make([]ClientUpdateLog, 0, limit)
 	for i := len(s.logs) - 1; i >= 0 && len(result) < limit; i-- {
 		result = append(result, s.logs[i])
+	}
+	return result
+}
+
+func (s *State) ListLogsByUpstreamScope(limit int, allowedUpstreamIDs map[string]struct{}) []ClientUpdateLog {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]ClientUpdateLog, 0)
+	for i := len(s.logs) - 1; i >= 0; i-- {
+		entry := s.logs[i]
+		if _, ok := allowedUpstreamIDs[entry.UpstreamID]; !ok {
+			continue
+		}
+		result = append(result, entry)
+		if limit > 0 && len(result) >= limit {
+			break
+		}
 	}
 	return result
 }
@@ -1104,6 +1795,25 @@ func (s *State) DeleteUpstream(id string) error {
 	delete(s.upstreams, id)
 	delete(s.caches, id)
 	delete(s.uaSeen, id)
+	for userID, user := range s.adminUsers {
+		if normalizeUpstreamScopeMode(user.UpstreamScopeMode) != UpstreamScopeModeSelected {
+			continue
+		}
+		nextScopeIDs := make([]string, 0, len(user.UpstreamScopeIDs))
+		for _, upstreamID := range user.UpstreamScopeIDs {
+			if upstreamID == id {
+				continue
+			}
+			nextScopeIDs = append(nextScopeIDs, upstreamID)
+		}
+		if len(nextScopeIDs) == 0 {
+			user.UpstreamScopeMode = UpstreamScopeModeAll
+			user.UpstreamScopeIDs = nil
+		} else {
+			user.UpstreamScopeIDs = nextScopeIDs
+		}
+		s.adminUsers[userID] = user
+	}
 	return s.saveLocked()
 }
 
@@ -1147,42 +1857,6 @@ func (s *State) IsCacheExpired(upstreamID, userAgent string) bool {
 	return false
 }
 
-func (s *State) CreateAdminSession() (string, error) {
-	buf := make([]byte, 32)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	token := hex.EncodeToString(buf)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.adminSessions[token] = time.Now().Add(24 * time.Hour)
-	return token, nil
-}
-
-func (s *State) ValidateAdminSession(token string) bool {
-	if token == "" {
-		return false
-	}
-	s.mu.RLock()
-	expiresAt, ok := s.adminSessions[token]
-	s.mu.RUnlock()
-	if !ok || time.Now().After(expiresAt) {
-		if ok {
-			s.mu.Lock()
-			delete(s.adminSessions, token)
-			s.mu.Unlock()
-		}
-		return false
-	}
-	return true
-}
-
-func (s *State) DeleteAdminSession(token string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.adminSessions, token)
-}
-
 func (s *State) load() error {
 	if _, err := os.Stat(s.dataFile); errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -1205,6 +1879,29 @@ func (s *State) load() error {
 	for _, key := range persisted.Keys {
 		s.keys[key.ID] = key
 		s.keysByToken[key.Key] = key.ID
+	}
+
+	for _, user := range persisted.Users {
+		username := normalizeAdminUsername(user.Username)
+		if user.ID == "" || username == "" {
+			continue
+		}
+		user.Username = username
+		user.Role = normalizeAdminRole(user.Role)
+		if user.Role == "" {
+			user.Role = AdminRoleViewer
+		}
+		user.CustomPermissions = normalizeCustomPermissions(user.CustomPermissions)
+		normalizedMode, normalizedIDs, err := s.normalizeAndValidateScopeLocked(user.UpstreamScopeMode, user.UpstreamScopeIDs)
+		if err != nil {
+			user.UpstreamScopeMode = UpstreamScopeModeAll
+			user.UpstreamScopeIDs = nil
+		} else {
+			user.UpstreamScopeMode = normalizedMode
+			user.UpstreamScopeIDs = normalizedIDs
+		}
+		s.adminUsers[user.ID] = user
+		s.adminUserByName[user.Username] = user.ID
 	}
 
 	s.logs = persisted.Logs
@@ -1249,12 +1946,18 @@ func (s *State) saveLocked() error {
 		keys = append(keys, key)
 	}
 
+	users := make([]AdminUser, 0, len(s.adminUsers))
+	for _, user := range s.adminUsers {
+		users = append(users, user)
+	}
+
 	persisted := persistedState{
 		Upstreams: upstreams,
 		Keys:      keys,
+		Users:     users,
 		Logs:      s.logs,
 		Config:    s.config,
-		Version:   3,
+		Version:   4,
 	}
 	if len(s.uaSeen) > 0 {
 		persisted.UASeen = make(map[string]map[string]int64, len(s.uaSeen))

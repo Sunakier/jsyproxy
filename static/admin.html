@@ -313,7 +313,10 @@
             <h2 style="text-align: center; margin-bottom: 1.5rem;">JsyProxy 管理后台</h2>
             <form id="login-form">
                 <div class="form-group">
-                    <input type="password" id="login-password" class="input" placeholder="请输入管理密码" required>
+                    <input type="text" id="login-username" class="input" placeholder="用户名（默认 admin）">
+                </div>
+                <div class="form-group">
+                    <input type="password" id="login-password" class="input" placeholder="请输入密码" required>
                 </div>
                 <button type="submit" class="btn btn-primary w-full">登录</button>
                 <div id="login-error" class="text-danger text-sm mt-4" style="text-align: center;"></div>
@@ -331,10 +334,12 @@
                     <div class="nav-item" data-view="cache">缓存状态</div>
                     <div class="nav-item" data-view="upstreams">上游管理</div>
                     <div class="nav-item" data-view="keys">Key管理</div>
+                    <div class="nav-item" data-view="users">用户管理</div>
                     <div class="nav-item" data-view="logs">访问日志</div>
                     <div class="nav-item" data-view="settings">全局设置</div>
                 </nav>
                 <div style="margin-top: auto;">
+                    <div id="current-user-meta" class="text-sm text-muted" style="padding: 0.75rem 1rem;"></div>
                     <div class="nav-item" id="logout-btn">退出登录</div>
                 </div>
             </div>
@@ -359,7 +364,126 @@
         const $ = (sel) => document.querySelector(sel);
         const $$ = (sel) => document.querySelectorAll(sel);
 
-        const state = { view: 'dashboard', logPage: 1, nodeStatusAutoTimers: [], nodesFocusUpstream: '' };
+        const PERM = {
+            ADMIN_READ: 'admin.read',
+            ADMIN_WRITE: 'admin.write',
+            SETTINGS_WRITE: 'settings.write',
+            UPSTREAM_READ: 'upstream.read',
+            UPSTREAM_WRITE: 'upstream.write',
+            KEY_READ: 'key.read',
+            KEY_WRITE: 'key.write',
+            LOG_READ: 'log.read',
+            USER_MANAGE: 'user.manage'
+        };
+
+        const ROLE_PERMISSIONS = {
+            super_admin: [PERM.ADMIN_READ, PERM.ADMIN_WRITE, PERM.SETTINGS_WRITE, PERM.UPSTREAM_READ, PERM.UPSTREAM_WRITE, PERM.KEY_READ, PERM.KEY_WRITE, PERM.LOG_READ, PERM.USER_MANAGE],
+            operator: [PERM.ADMIN_READ, PERM.ADMIN_WRITE, PERM.SETTINGS_WRITE, PERM.UPSTREAM_READ, PERM.UPSTREAM_WRITE, PERM.KEY_READ, PERM.KEY_WRITE, PERM.LOG_READ],
+            viewer: [PERM.ADMIN_READ, PERM.UPSTREAM_READ, PERM.KEY_READ, PERM.LOG_READ]
+        };
+
+        const VIEW_REQUIRED_PERMISSION = {
+            dashboard: PERM.ADMIN_READ,
+            nodes: PERM.UPSTREAM_READ,
+            cache: PERM.UPSTREAM_READ,
+            upstreams: PERM.UPSTREAM_READ,
+            keys: PERM.KEY_READ,
+            users: PERM.USER_MANAGE,
+            logs: PERM.LOG_READ,
+            settings: PERM.ADMIN_READ
+        };
+
+        const PERM_LABELS = {
+            [PERM.ADMIN_READ]: '管理台概览读取',
+            [PERM.ADMIN_WRITE]: '管理台刷新/写入操作',
+            [PERM.SETTINGS_WRITE]: '全局设置修改',
+            [PERM.UPSTREAM_READ]: '上游读取',
+            [PERM.UPSTREAM_WRITE]: '上游写入/刷新/去重/删缓存',
+            [PERM.KEY_READ]: 'Key读取',
+            [PERM.KEY_WRITE]: 'Key写入',
+            [PERM.LOG_READ]: '日志读取',
+            [PERM.USER_MANAGE]: '用户管理'
+        };
+
+        const ROLE_DESCRIPTIONS = {
+            super_admin: '超级管理员：默认拥有全部功能权限，可管理用户、权限与上游范围。',
+            operator: '运维管理员：默认可管理上游、Key、设置与日志，不含用户管理。',
+            viewer: '只读用户：默认仅可查看概览、上游、Key和日志，不可写操作。'
+        };
+
+        const state = {
+            view: 'dashboard',
+            logPage: 1,
+            nodeStatusAutoTimers: [],
+            nodesFocusUpstream: '',
+            currentUser: null,
+            permissions: new Set(),
+            allPermissions: [],
+            rolePermissions: { ...ROLE_PERMISSIONS },
+            userScopeModes: ['all', 'selected'],
+            userAssignableUpstreams: []
+        };
+
+        function normalizeRole(role) {
+            return String(role || '').trim();
+        }
+
+        function setCurrentUser(user) {
+            const role = normalizeRole(user?.role);
+            const effectivePermissions = Array.isArray(user?.effective_permissions)
+                ? user.effective_permissions
+                : (ROLE_PERMISSIONS[role] || []);
+            state.currentUser = {
+                id: String(user?.id || '').trim(),
+                username: String(user?.username || '').trim(),
+                role,
+                effective_permissions: effectivePermissions,
+                custom_permissions: Array.isArray(user?.custom_permissions) ? user.custom_permissions : [],
+                upstream_scope_mode: String(user?.upstream_scope_mode || 'all').trim(),
+                upstream_scope_ids: Array.isArray(user?.upstream_scope_ids) ? user.upstream_scope_ids : []
+            };
+            state.permissions = new Set(effectivePermissions);
+            syncCurrentUserMeta();
+            applyNavigationPermissions();
+        }
+
+        function hasPermission(permission) {
+            return state.permissions.has(permission);
+        }
+
+        function canView(view) {
+            const required = VIEW_REQUIRED_PERMISSION[view];
+            if (!required) return true;
+            return hasPermission(required);
+        }
+
+        function firstAllowedView() {
+            const preferredOrder = ['dashboard', 'upstreams', 'keys', 'logs'];
+            for (const view of preferredOrder) {
+                if (canView(view)) return view;
+            }
+            return 'dashboard';
+        }
+
+        function syncCurrentUserMeta() {
+            const el = $('#current-user-meta');
+            if (!el) return;
+            if (!state.currentUser) {
+                el.textContent = '';
+                return;
+            }
+            const roleText = state.currentUser.role || '-';
+            const username = state.currentUser.username || state.currentUser.id || '-';
+            el.textContent = `${username} (${roleText})`;
+        }
+
+        function applyNavigationPermissions() {
+            $$('.nav-item[data-view]').forEach(item => {
+                const view = item.dataset.view;
+                const allowed = canView(view);
+                item.classList.toggle('hidden', !allowed);
+            });
+        }
 
         async function api(path, options = {}) {
             const res = await fetch('/admin/api' + path, {
@@ -371,6 +495,9 @@
             if (!res.ok) {
                 if (res.status === 401) {
                     showLogin();
+                }
+                if (res.status === 403) {
+                    throw new Error(data.error || '权限不足');
                 }
                 throw new Error(data.error || 'Request failed');
             }
@@ -388,12 +515,16 @@
         function showLogin() {
             $('#login-view').classList.remove('hidden');
             $('#app-view').classList.add('hidden');
+            state.currentUser = null;
+            state.permissions = new Set();
+            syncCurrentUserMeta();
+            applyNavigationPermissions();
         }
 
         function showApp() {
             $('#login-view').classList.add('hidden');
             $('#app-view').classList.remove('hidden');
-            navigate('dashboard');
+            navigate(firstAllowedView());
         }
 
         function clearNodeStatusAutoTimers() {
@@ -408,6 +539,10 @@
         }
 
         function navigate(view) {
+            if (!canView(view)) {
+                showToast('当前账号无权访问该页面', 'error');
+                view = firstAllowedView();
+            }
             clearNodeStatusAutoTimers();
             state.view = view;
             $$('.nav-item[data-view]').forEach(n => {
@@ -415,7 +550,7 @@
             });
             $('#header-actions').innerHTML = '';
             
-            const titles = { dashboard: '概览', nodes: '节点状态', cache: '缓存状态', upstreams: '上游管理', keys: 'Key管理', logs: '访问日志', settings: '全局设置' };
+            const titles = { dashboard: '概览', nodes: '节点状态', cache: '缓存状态', upstreams: '上游管理', keys: 'Key管理', users: '用户管理', logs: '访问日志', settings: '全局设置' };
             $('#page-title').textContent = titles[view] || view;
 
             switch(view) {
@@ -424,6 +559,7 @@
                 case 'cache': renderCache(); break;
                 case 'upstreams': renderUpstreams(); break;
                 case 'keys': renderKeys(); break;
+                case 'users': renderUsers(); break;
                 case 'logs': renderLogs(); break;
                 case 'settings': renderSettings(); break;
             }
@@ -435,6 +571,10 @@
             
             try {
                 const data = await api('/status');
+                if (data.current_user) {
+                    setCurrentUser(data.current_user);
+                }
+                const canWriteUpstream = hasPermission(PERM.UPSTREAM_WRITE);
                 
                 let html = `
                     <div class="stats-grid">
@@ -485,7 +625,7 @@
                                         ${renderNodeStatusPanelHTML(nodeStatus)}
                                     </div>
                                     <div class="dash-actions" style="margin-top:0.6rem;">
-                                        <button class="btn btn-secondary btn-sm" data-node-investigate="${escapeHtml(u.id)}" data-node-panel="${escapeHtml(nodePanelId)}">调研拉取</button>
+                                        ${canWriteUpstream ? `<button class="btn btn-secondary btn-sm" data-node-investigate="${escapeHtml(u.id)}" data-node-panel="${escapeHtml(nodePanelId)}">调研拉取</button>` : ''}
                                         <button class="btn btn-primary btn-sm" data-node-jump="${escapeHtml(u.id)}">节点列表页</button>
                                     </div>
                                 </div>
@@ -642,6 +782,7 @@
             const panel = document.getElementById(panelID);
             const forceRefresh = !!options.forceRefresh;
             const silent = !!options.silent;
+            const canWriteUpstream = hasPermission(PERM.UPSTREAM_WRITE);
 
             let cachedData = null;
             try {
@@ -657,6 +798,11 @@
                     if (!silent) showToast('已展示有效缓存，未触发强制刷新', 'info');
                     return;
                 }
+            }
+
+            if (!canWriteUpstream) {
+                if (!silent) showToast('当前账号仅有只读权限，无法触发拉取', 'info');
+                return;
             }
 
             try {
@@ -808,12 +954,18 @@
             const content = $('#content-area');
             content.innerHTML = '<div class="text-muted">加载节点页面中...</div>';
 
-            $('#header-actions').innerHTML = `
+            const canWriteUpstream = hasPermission(PERM.UPSTREAM_WRITE);
+
+            $('#header-actions').innerHTML = canWriteUpstream
+                ? `
                 <button class="btn btn-secondary btn-sm" id="nodes-refresh-cache">刷新(优先缓存)</button>
                 <button class="btn btn-primary btn-sm" id="nodes-refresh-force">强制全量拉取</button>
-            `;
+            `
+                : '<span class="text-sm text-muted">当前为只读模式</span>';
+            if (canWriteUpstream) {
             $('#nodes-refresh-cache').onclick = () => renderNodes({ forceRefresh: false });
             $('#nodes-refresh-force').onclick = () => renderNodes({ forceRefresh: true });
+            }
 
             try {
                 const statusData = await api('/status');
@@ -886,7 +1038,7 @@
 
                 const entries = await Promise.all(upstreams.map(async upstream => {
                     try {
-                        const data = await loadUpstreamNodeStatus(upstream, { forceRefresh });
+                        const data = await loadUpstreamNodeStatus(upstream, { forceRefresh: canWriteUpstream ? forceRefresh : false });
                         return { upstream, data, error: null };
                     } catch (e) {
                         return { upstream, data: null, error: e };
@@ -1001,6 +1153,7 @@
         async function renderCache() {
             const content = $('#content-area');
             content.innerHTML = '<div class="text-muted">加载中...</div>';
+            const canWriteUpstream = hasPermission(PERM.UPSTREAM_WRITE);
             
             try {
                 const cacheData = await api('/cache-status');
@@ -1041,7 +1194,9 @@
                                 : '-';
                             const actionBtn = item.is_default
                                 ? '<span class="text-sm text-muted">-</span>'
-                                : `<button class="btn btn-danger btn-sm" data-cache-upstream="${escapeHtml(u.id)}" data-cache-ua="${escapeHtml(item.user_agent || '')}">删除</button>`;
+                                : (canWriteUpstream
+                                    ? `<button class="btn btn-danger btn-sm" data-cache-upstream="${escapeHtml(u.id)}" data-cache-ua="${escapeHtml(item.user_agent || '')}">删除</button>`
+                                    : '<span class="text-sm text-muted">只读</span>');
                                 
                             return `
                                 <tr>
@@ -1114,6 +1269,10 @@
         }
 
         async function deleteUACacheVariant(upstreamID, userAgent) {
+            if (!hasPermission(PERM.UPSTREAM_WRITE)) {
+                showToast('当前账号无删除权限', 'error');
+                return;
+            }
             if (!upstreamID || !userAgent) {
                 showToast('缺少必要参数，无法删除UA缓存', 'error');
                 return;
@@ -1135,8 +1294,11 @@
 
         async function renderUpstreams() {
             const actions = $('#header-actions');
-            actions.innerHTML = '<button class="btn btn-primary" id="add-upstream-btn">+ 添加上游</button>';
-            $('#add-upstream-btn').onclick = () => openUpstreamModal();
+            const canWriteUpstream = hasPermission(PERM.UPSTREAM_WRITE);
+            actions.innerHTML = canWriteUpstream ? '<button class="btn btn-primary" id="add-upstream-btn">+ 添加上游</button>' : '<span class="text-sm text-muted">当前为只读模式</span>';
+            if (canWriteUpstream) {
+                $('#add-upstream-btn').onclick = () => openUpstreamModal();
+            }
 
             const content = $('#content-area');
             content.innerHTML = '<div class="text-muted">加载中...</div>';
@@ -1159,6 +1321,14 @@
                     const strategy = u.cache_strategy === 'force' ? '强制' : '懒加载';
                     const toggleStrategy = u.cache_strategy === 'force' ? 'lazy' : 'force';
                     const toggleLabel = u.cache_strategy === 'force' ? '切换为懒缓存' : '切换为强制';
+                    const operationButtons = canWriteUpstream
+                        ? `
+                            <button class="btn btn-secondary btn-sm" data-up-refresh="${u.id}">刷新</button>
+                            <button class="btn btn-secondary btn-sm" data-up-dedupe="${u.id}">去重</button>
+                            <button class="btn btn-primary btn-sm" data-up-idx="${idx}">✎</button>
+                            <button class="btn btn-danger btn-sm" data-up-del="${u.id}">🗑️</button>
+                        `
+                        : '<span class="text-sm text-muted">只读</span>';
                     
                     html += `
                         <div class="dash-card">
@@ -1188,10 +1358,10 @@
                                     <span class="dash-label">策略</span>
                                     <div class="dash-btn-group items-center">
                                         <span class="dash-value sm">${strategy}</span>
-                                        <button class="btn btn-secondary btn-sm" style="font-size: 0.7rem; padding: 2px 6px;" 
+                                        ${canWriteUpstream ? `<button class="btn btn-secondary btn-sm" style="font-size: 0.7rem; padding: 2px 6px;" 
                                             data-up-toggle-strategy="${u.id}" 
                                             data-up-target-strategy="${toggleStrategy}"
-                                            title="${toggleLabel}">⇄</button>
+                                            title="${toggleLabel}">⇄</button>` : ''}
                                     </div>
                                 </div>
 
@@ -1200,45 +1370,48 @@
                                     <span class="dash-value sm">${escapeHtml(u.refresh_interval || '10m')}</span>
                                 </div>
                             </div>
-                            <div class="dash-card-footer">
-                                <div class="dash-actions">
-                                    <button class="btn btn-secondary btn-sm" data-up-refresh="${u.id}">刷新</button>
-                                    <button class="btn btn-secondary btn-sm" data-up-dedupe="${u.id}">去重</button>
-                                    <button class="btn btn-primary btn-sm" data-up-idx="${idx}">✎</button>
-                                    <button class="btn btn-danger btn-sm" data-up-del="${u.id}">🗑️</button>
+                                <div class="dash-card-footer">
+                                    <div class="dash-actions">
+                                        ${operationButtons}
+                                    </div>
                                 </div>
                             </div>
-                        </div>
                     `;
                 });
 
                 html += '</div>';
                 content.innerHTML = html;
 
-                content.querySelectorAll('[data-up-refresh]').forEach(btn => {
-                    btn.onclick = () => refreshUpstream(btn.dataset.upRefresh);
-                });
-                content.querySelectorAll('[data-up-dedupe]').forEach(btn => {
-                    btn.onclick = () => dedupeUpstreamCache(btn.dataset.upDedupe);
-                });
-                content.querySelectorAll('[data-up-toggle-strategy]').forEach(btn => {
-                    btn.onclick = () => switchCacheStrategy(btn.dataset.upToggleStrategy, btn.dataset.upTargetStrategy);
-                });
-                content.querySelectorAll('[data-up-idx]').forEach(btn => {
-                    btn.onclick = () => {
-                        const idx = parseInt(btn.dataset.upIdx);
-                        openUpstreamModal(cachedUpstreamsList[idx]);
-                    };
-                });
-                content.querySelectorAll('[data-up-del]').forEach(btn => {
-                    btn.onclick = () => deleteUpstream(btn.dataset.upDel);
-                });
+                if (canWriteUpstream) {
+                    content.querySelectorAll('[data-up-refresh]').forEach(btn => {
+                        btn.onclick = () => refreshUpstream(btn.dataset.upRefresh);
+                    });
+                    content.querySelectorAll('[data-up-dedupe]').forEach(btn => {
+                        btn.onclick = () => dedupeUpstreamCache(btn.dataset.upDedupe);
+                    });
+                    content.querySelectorAll('[data-up-toggle-strategy]').forEach(btn => {
+                        btn.onclick = () => switchCacheStrategy(btn.dataset.upToggleStrategy, btn.dataset.upTargetStrategy);
+                    });
+                    content.querySelectorAll('[data-up-idx]').forEach(btn => {
+                        btn.onclick = () => {
+                            const idx = parseInt(btn.dataset.upIdx);
+                            openUpstreamModal(cachedUpstreamsList[idx]);
+                        };
+                    });
+                    content.querySelectorAll('[data-up-del]').forEach(btn => {
+                        btn.onclick = () => deleteUpstream(btn.dataset.upDel);
+                    });
+                }
             } catch (e) {
                 content.innerHTML = '<div class="text-danger">加载失败: ' + escapeHtml(e.message) + '</div>';
             }
         }
 
         async function switchCacheStrategy(id, newStrategy) {
+            if (!hasPermission(PERM.UPSTREAM_WRITE)) {
+                showToast('当前账号无操作权限', 'error');
+                return;
+            }
             try {
                 // Find current upstream data to preserve other fields
                 const upstream = cachedUpstreamsList.find(u => u.id === id);
@@ -1255,6 +1428,10 @@
         }
 
         async function refreshUpstream(id) {
+            if (!hasPermission(PERM.UPSTREAM_WRITE)) {
+                showToast('当前账号无操作权限', 'error');
+                return;
+            }
             try {
                 await api('/upstreams/' + id + '/refresh', { method: 'POST' });
                 showToast('刷新成功', 'success');
@@ -1264,6 +1441,10 @@
         }
 
         async function dedupeUpstreamCache(id) {
+            if (!hasPermission(PERM.UPSTREAM_WRITE)) {
+                showToast('当前账号无操作权限', 'error');
+                return;
+            }
             try {
                 const result = await api('/upstreams/' + id + '/dedupe', { method: 'POST' });
                 showToast(`去重完成：移除 ${result.removed || 0} 个，剩余 ${result.remain || 0} 个`, 'success');
@@ -1274,6 +1455,10 @@
         }
 
         async function deleteUpstream(id) {
+            if (!hasPermission(PERM.UPSTREAM_WRITE)) {
+                showToast('当前账号无操作权限', 'error');
+                return;
+            }
             if (!confirm('确定删除此上游？')) return;
             try {
                 await api('/upstreams/' + id, { method: 'DELETE' });
@@ -1285,6 +1470,10 @@
         }
 
         function openUpstreamModal(data = null) {
+            if (!hasPermission(PERM.UPSTREAM_WRITE)) {
+                showToast('当前账号无操作权限', 'error');
+                return;
+            }
             const isEdit = !!data;
             const html = `
                 <div class="form-group">
@@ -1393,14 +1582,18 @@
 
         let cachedUpstreams = [];
         let cachedKeys = [];
+        let cachedUsers = [];
 
         async function renderKeys() {
             const actions = $('#header-actions');
+            const canWriteKey = hasPermission(PERM.KEY_WRITE);
             actions.innerHTML = `
                 <button class="btn btn-secondary" id="help-btn">使用说明</button>
-                <button class="btn btn-primary" id="add-key-btn">+ 添加Key</button>
+                ${canWriteKey ? '<button class="btn btn-primary" id="add-key-btn">+ 添加Key</button>' : ''}
             `;
-            $('#add-key-btn').onclick = () => openKeyModal();
+            if (canWriteKey) {
+                $('#add-key-btn').onclick = () => openKeyModal();
+            }
             $('#help-btn').onclick = () => showHelpModal();
 
             const content = $('#content-area');
@@ -1438,6 +1631,13 @@
                                            cachedUpstreams.find(u => u.id === k.upstream_id)?.name || 
                                            k.upstream_id?.substring(0,8) || 
                                            '-';
+                        const operationButtons = canWriteKey
+                            ? `
+                                <button class="btn btn-secondary btn-sm" data-copy-key="${k.key}" title="复制订阅链接">📋</button>
+                                <button class="btn btn-primary btn-sm" data-key-idx="${idx}">✎</button>
+                                <button class="btn btn-danger btn-sm" data-key-del="${k.id}">🗑️</button>
+                            `
+                            : `<button class="btn btn-secondary btn-sm" data-copy-key="${k.key}" title="复制订阅链接">📋</button>`;
 
                         html += `
                             <div class="dash-card">
@@ -1459,9 +1659,7 @@
                                 </div>
                                 <div class="dash-card-footer">
                                     <div class="dash-actions">
-                                        <button class="btn btn-secondary btn-sm" data-copy-key="${k.key}" title="复制订阅链接">📋</button>
-                                        <button class="btn btn-primary btn-sm" data-key-idx="${idx}">✎</button>
-                                        <button class="btn btn-danger btn-sm" data-key-del="${k.id}">🗑️</button>
+                                        ${operationButtons}
                                     </div>
                                 </div>
                             </div>
@@ -1472,15 +1670,17 @@
 
                 content.innerHTML = html;
 
-                content.querySelectorAll('[data-key-idx]').forEach(btn => {
-                    btn.onclick = () => {
-                        const idx = parseInt(btn.dataset.keyIdx);
-                        openKeyModal(cachedKeys[idx]);
-                    };
-                });
-                content.querySelectorAll('[data-key-del]').forEach(btn => {
-                    btn.onclick = () => deleteKey(btn.dataset.keyDel);
-                });
+                if (canWriteKey) {
+                    content.querySelectorAll('[data-key-idx]').forEach(btn => {
+                        btn.onclick = () => {
+                            const idx = parseInt(btn.dataset.keyIdx);
+                            openKeyModal(cachedKeys[idx]);
+                        };
+                    });
+                    content.querySelectorAll('[data-key-del]').forEach(btn => {
+                        btn.onclick = () => deleteKey(btn.dataset.keyDel);
+                    });
+                }
                 content.querySelectorAll('[data-copy-key]').forEach(btn => {
                     btn.onclick = () => copySubscribeLink(btn.dataset.copyKey);
                 });
@@ -1494,7 +1694,277 @@
             }
         }
 
+        function roleLabel(role) {
+            if (role === 'super_admin') return '超级管理员';
+            if (role === 'operator') return '运维管理员';
+            if (role === 'viewer') return '只读用户';
+            return role || '-';
+        }
+
+        async function renderUsers() {
+            const content = $('#content-area');
+            content.innerHTML = '<div class="text-muted">加载中...</div>';
+            const canManageUsers = hasPermission(PERM.USER_MANAGE);
+            const actions = $('#header-actions');
+            actions.innerHTML = canManageUsers
+                ? '<button class="btn btn-primary" id="add-user-btn">+ 添加用户</button>'
+                : '<span class="text-sm text-muted">当前账号无用户管理权限</span>';
+            if (canManageUsers) {
+                $('#add-user-btn').onclick = () => openUserModal();
+            }
+
+            try {
+                const data = await api('/users');
+                cachedUsers = data.users || [];
+                state.allPermissions = Array.isArray(data.all_permissions) && data.all_permissions.length > 0
+                    ? data.all_permissions
+                    : Object.values(PERM);
+                state.rolePermissions = data.role_permissions || { ...ROLE_PERMISSIONS };
+                state.userScopeModes = Array.isArray(data.upstream_scope_modes) && data.upstream_scope_modes.length > 0
+                    ? data.upstream_scope_modes
+                    : ['all', 'selected'];
+                state.userAssignableUpstreams = Array.isArray(data.upstreams) ? data.upstreams : [];
+                if (cachedUsers.length === 0) {
+                    content.innerHTML = '<div class="card text-muted">暂无用户</div>';
+                    return;
+                }
+
+                const roleHelp = ['super_admin', 'operator', 'viewer'].map(role => {
+                    const perms = state.rolePermissions[role] || ROLE_PERMISSIONS[role] || [];
+                    const items = perms.map(p => `<span class="tag tag-blue">${escapeHtml(PERM_LABELS[p] || p)}</span>`).join(' ');
+                    return `
+                        <div style="margin-bottom:0.75rem;">
+                            <div><strong>${escapeHtml(roleLabel(role))}</strong></div>
+                            <div class="text-sm text-muted" style="margin:0.2rem 0 0.4rem;">${escapeHtml(ROLE_DESCRIPTIONS[role] || '')}</div>
+                            <div style="display:flex; gap:0.3rem; flex-wrap:wrap;">${items || '<span class="text-sm text-muted">无默认权限</span>'}</div>
+                        </div>
+                    `;
+                }).join('');
+
+                let html = `
+                    <div class="card" style="margin-bottom:1rem;">
+                        <div class="card-title" style="margin-bottom:0.75rem;">预设角色权限说明</div>
+                        <div class="text-sm text-muted" style="margin-bottom:0.75rem;">可在用户编辑时基于预设角色叠加“自定义功能权限”，并限制可访问的上游范围。</div>
+                        ${roleHelp}
+                    </div>
+                    <div class="dash-card">
+                        <div class="dash-card-header">
+                            <div class="dash-card-title">管理员用户</div>
+                        </div>
+                        <div class="dash-card-body" style="padding:0;">
+                            <div class="table-container">
+                                <table>
+                                    <thead>
+                                        <tr><th>用户名</th><th>角色</th><th>上游范围</th><th>自定义权限</th><th>状态</th><th>创建时间</th><th>更新时间</th><th>操作</th></tr>
+                                    </thead>
+                                    <tbody>
+                `;
+
+                cachedUsers.forEach((u, idx) => {
+                    const statusText = u.enabled ? '<span class="tag tag-green">启用</span>' : '<span class="tag tag-red">禁用</span>';
+                    const isCurrentUser = state.currentUser && state.currentUser.id === u.id;
+                    const scopeText = u.upstream_scope_mode === 'selected'
+                        ? `指定(${(u.upstream_scope_ids || []).length})`
+                        : '全部上游';
+                    const customPerms = Array.isArray(u.custom_permissions) ? u.custom_permissions : [];
+                    const customPermText = customPerms.length > 0
+                        ? customPerms.map(p => PERM_LABELS[p] || p).join('、')
+                        : '-';
+                    const operationButtons = canManageUsers
+                        ? `
+                            <button class="btn btn-primary btn-sm" data-user-edit="${idx}">编辑</button>
+                            <button class="btn btn-secondary btn-sm" data-user-password="${u.id}">改密</button>
+                            <button class="btn btn-danger btn-sm" data-user-delete="${u.id}" ${isCurrentUser ? 'disabled' : ''}>删除</button>
+                          `
+                        : '<span class="text-sm text-muted">-</span>';
+                    html += `
+                        <tr>
+                            <td>${escapeHtml(u.username || '-')} ${isCurrentUser ? '<span class="tag tag-blue">当前</span>' : ''}</td>
+                            <td>${escapeHtml(roleLabel(u.role))}</td>
+                            <td class="text-sm">${escapeHtml(scopeText)}</td>
+                            <td class="text-sm" title="${escapeHtml(customPermText)}">${escapeHtml(customPermText.length > 32 ? customPermText.slice(0, 32) + '...' : customPermText)}</td>
+                            <td>${statusText}</td>
+                            <td>${u.created_at ? new Date(u.created_at).toLocaleString() : '-'}</td>
+                            <td>${u.updated_at ? new Date(u.updated_at).toLocaleString() : '-'}</td>
+                            <td><div class="dash-actions">${operationButtons}</div></td>
+                        </tr>
+                    `;
+                });
+
+                html += '</tbody></table></div></div></div>';
+                content.innerHTML = html;
+
+                if (canManageUsers) {
+                    content.querySelectorAll('[data-user-edit]').forEach(btn => {
+                        btn.onclick = () => {
+                            const idx = parseInt(btn.dataset.userEdit, 10);
+                            openUserModal(cachedUsers[idx]);
+                        };
+                    });
+                    content.querySelectorAll('[data-user-password]').forEach(btn => {
+                        btn.onclick = () => openUserPasswordModal(btn.dataset.userPassword);
+                    });
+                    content.querySelectorAll('[data-user-delete]').forEach(btn => {
+                        btn.onclick = () => deleteUser(btn.dataset.userDelete);
+                    });
+                }
+            } catch (e) {
+                content.innerHTML = '<div class="text-danger">加载失败: ' + escapeHtml(e.message) + '</div>';
+            }
+        }
+
+        function openUserModal(data = null) {
+            if (!hasPermission(PERM.USER_MANAGE)) {
+                showToast('当前账号无操作权限', 'error');
+                return;
+            }
+            const isEdit = !!data;
+            const rolePerms = state.rolePermissions || { ...ROLE_PERMISSIONS };
+            const selectedCustomPerms = new Set(Array.isArray(data?.custom_permissions) ? data.custom_permissions : []);
+            const selectedScopeMode = String(data?.upstream_scope_mode || 'all').trim() || 'all';
+            const selectedScopeIDs = new Set(Array.isArray(data?.upstream_scope_ids) ? data.upstream_scope_ids : []);
+            const permissionOptions = (state.allPermissions || Object.values(PERM)).map(permission => {
+                const checked = selectedCustomPerms.has(permission) ? 'checked' : '';
+                return `<label style="display:flex; align-items:center; gap:0.45rem; margin-bottom:0.35rem;"><input type="checkbox" class="user-custom-permission" value="${escapeHtml(permission)}" ${checked}> <span>${escapeHtml(PERM_LABELS[permission] || permission)}</span></label>`;
+            }).join('');
+
+            const upstreamOptions = (state.userAssignableUpstreams || []).map(upstream => {
+                const checked = selectedScopeIDs.has(upstream.id) ? 'checked' : '';
+                return `<label style="display:flex; align-items:center; gap:0.45rem; margin-bottom:0.35rem;"><input type="checkbox" class="user-upstream-id" value="${escapeHtml(upstream.id)}" ${checked}> <span>${escapeHtml(upstream.name || upstream.id)}</span></label>`;
+            }).join('');
+
+            const html = `
+                <div class="form-group">
+                    <label class="form-label">用户名 *</label>
+                    <input type="text" class="input" id="user-username" value="${escapeHtml(data?.username || '')}" required>
+                </div>
+                ${isEdit ? '' : `<div class="form-group"><label class="form-label">密码 *</label><input type="password" class="input" id="user-password" required></div>`}
+                <div class="form-group">
+                    <label class="form-label">角色 *</label>
+                    <select class="input" id="user-role">
+                        <option value="super_admin" ${data?.role === 'super_admin' ? 'selected' : ''}>超级管理员</option>
+                        <option value="operator" ${data?.role === 'operator' ? 'selected' : ''}>运维管理员</option>
+                        <option value="viewer" ${data?.role === 'viewer' ? 'selected' : ''}>只读用户</option>
+                    </select>
+                    <div class="form-hint" id="user-role-perms-hint"></div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">自定义功能权限（在角色默认权限基础上叠加）</label>
+                    <div style="max-height:200px; overflow:auto; border:1px solid var(--border); border-radius: var(--radius); padding:0.6rem;">${permissionOptions || '<span class="text-sm text-muted">无可配置权限</span>'}</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">上游访问范围</label>
+                    <select class="input" id="user-scope-mode">
+                        <option value="all" ${selectedScopeMode === 'all' ? 'selected' : ''}>全部上游</option>
+                        <option value="selected" ${selectedScopeMode === 'selected' ? 'selected' : ''}>指定上游</option>
+                    </select>
+                    <div class="form-hint">选择“指定上游”后，仅允许访问勾选的上游。</div>
+                </div>
+                <div class="form-group" id="user-scope-upstreams-wrap">
+                    <label class="form-label">可访问上游</label>
+                    <div style="max-height:180px; overflow:auto; border:1px solid var(--border); border-radius: var(--radius); padding:0.6rem;">${upstreamOptions || '<span class="text-sm text-muted">暂无可选上游</span>'}</div>
+                </div>
+                <div class="form-group">
+                    <label><input type="checkbox" id="user-enabled" ${!data || data.enabled ? 'checked' : ''}> 启用</label>
+                </div>
+            `;
+
+            showModal(isEdit ? '编辑用户' : '添加用户', html, async () => {
+                const username = ($('#user-username')?.value || '').trim();
+                const role = $('#user-role')?.value || 'viewer';
+                const enabled = !!$('#user-enabled')?.checked;
+                const customPermissions = Array.from($$('.user-custom-permission')).filter(el => el.checked).map(el => el.value);
+                const upstreamScopeMode = ($('#user-scope-mode')?.value || 'all').trim();
+                const upstreamScopeIDs = Array.from($$('.user-upstream-id')).filter(el => el.checked).map(el => el.value);
+                if (!username) throw new Error('用户名不能为空');
+                if (upstreamScopeMode === 'selected' && upstreamScopeIDs.length === 0) {
+                    throw new Error('请选择至少一个可访问上游');
+                }
+
+                if (isEdit) {
+                    await api('/users/' + encodeURIComponent(data.id), {
+                        method: 'PUT',
+                        body: JSON.stringify({ username, role, enabled, custom_permissions: customPermissions, upstream_scope_mode: upstreamScopeMode, upstream_scope_ids: upstreamScopeIDs })
+                    });
+                } else {
+                    const password = ($('#user-password')?.value || '').trim();
+                    if (!password) throw new Error('密码不能为空');
+                    await api('/users', {
+                        method: 'POST',
+                        body: JSON.stringify({ username, password, role, custom_permissions: customPermissions, upstream_scope_mode: upstreamScopeMode, upstream_scope_ids: upstreamScopeIDs })
+                    });
+                }
+                showToast('保存成功', 'success');
+                renderUsers();
+                return true;
+            });
+
+            const syncRoleHint = () => {
+                const role = $('#user-role')?.value || 'viewer';
+                const perms = rolePerms[role] || ROLE_PERMISSIONS[role] || [];
+                const text = perms.length > 0
+                    ? `角色默认权限：${perms.map(p => PERM_LABELS[p] || p).join('、')}`
+                    : '角色默认无权限';
+                const hint = $('#user-role-perms-hint');
+                if (hint) hint.textContent = text;
+            };
+            const syncScopeVisibility = () => {
+                const mode = $('#user-scope-mode')?.value || 'all';
+                const wrap = $('#user-scope-upstreams-wrap');
+                if (!wrap) return;
+                wrap.style.display = mode === 'selected' ? 'block' : 'none';
+            };
+            const roleInput = $('#user-role');
+            if (roleInput) roleInput.onchange = syncRoleHint;
+            const scopeModeInput = $('#user-scope-mode');
+            if (scopeModeInput) scopeModeInput.onchange = syncScopeVisibility;
+            syncRoleHint();
+            syncScopeVisibility();
+        }
+
+        function openUserPasswordModal(userID) {
+            if (!hasPermission(PERM.USER_MANAGE)) {
+                showToast('当前账号无操作权限', 'error');
+                return;
+            }
+            showModal('重置用户密码', `
+                <div class="form-group">
+                    <label class="form-label">新密码 *</label>
+                    <input type="password" class="input" id="user-new-password" required>
+                </div>
+            `, async () => {
+                const password = ($('#user-new-password')?.value || '').trim();
+                if (!password) throw new Error('密码不能为空');
+                await api('/users/' + encodeURIComponent(userID) + '/password', {
+                    method: 'PUT',
+                    body: JSON.stringify({ password })
+                });
+                showToast('密码已更新', 'success');
+                return true;
+            });
+        }
+
+        async function deleteUser(userID) {
+            if (!hasPermission(PERM.USER_MANAGE)) {
+                showToast('当前账号无操作权限', 'error');
+                return;
+            }
+            if (!userID) return;
+            if (!confirm('确定删除该用户？')) return;
+            try {
+                await api('/users/' + encodeURIComponent(userID), { method: 'DELETE' });
+                showToast('用户已删除', 'success');
+                renderUsers();
+            } catch (e) {
+                showToast(e.message || '删除失败', 'error');
+            }
+        }
+
         async function deleteKey(id) {
+            if (!hasPermission(PERM.KEY_WRITE)) {
+                showToast('当前账号无操作权限', 'error');
+                return;
+            }
             if (!confirm('确定删除此Key？')) return;
             try {
                 await api('/keys/' + id, { method: 'DELETE' });
@@ -1506,6 +1976,10 @@
         }
 
         function openKeyModal(data = null) {
+            if (!hasPermission(PERM.KEY_WRITE)) {
+                showToast('当前账号无操作权限', 'error');
+                return;
+            }
             const isEdit = !!data;
             let optionsHtml = '<option value="">-- 请选择 --</option>';
             cachedUpstreams.forEach(u => {
@@ -1778,6 +2252,7 @@
         async function renderSettings() {
             const content = $('#content-area');
             content.innerHTML = '<div class="text-muted">加载中...</div>';
+            const canWriteSettings = hasPermission(PERM.SETTINGS_WRITE);
             try {
                 const data = await api('/settings');
                 const config = data.global_config || {};
@@ -1825,24 +2300,27 @@
                         <div class="dash-card-footer">
                             <div class="dash-actions">
                                 <button class="btn btn-secondary" id="export-rules-btn">导出规则</button>
-                                <button class="btn btn-secondary" id="import-rules-btn">导入规则</button>
-                                <button class="btn btn-secondary" id="validate-rules-btn">验证规则</button>
-                                <button class="btn btn-primary" id="save-settings-btn">保存设置</button>
+                                <button class="btn btn-secondary" id="import-rules-btn" ${canWriteSettings ? '' : 'disabled'}>导入规则</button>
+                                <button class="btn btn-secondary" id="validate-rules-btn" ${canWriteSettings ? '' : 'disabled'}>验证规则</button>
+                                <button class="btn btn-primary" id="save-settings-btn" ${canWriteSettings ? '' : 'disabled'}>保存设置</button>
                             </div>
                         </div>
                     </div>
                 `;
 
                 $('#export-rules-btn').onclick = exportUARules;
-                $('#import-rules-btn').onclick = () => {
-                    const fileInput = $('#ua-rules-import-file');
-                    if (!fileInput) return;
-                    fileInput.value = '';
-                    fileInput.click();
-                };
+                if (canWriteSettings) {
+                    $('#import-rules-btn').onclick = () => {
+                        const fileInput = $('#ua-rules-import-file');
+                        if (!fileInput) return;
+                        fileInput.value = '';
+                        fileInput.click();
+                    };
+                }
                 const importInput = $('#ua-rules-import-file');
                 if (importInput) {
                     importInput.onchange = async () => {
+                        if (!canWriteSettings) return;
                         const file = importInput.files && importInput.files[0];
                         if (!file) return;
                         await importUARulesFromFile(file);
@@ -1850,6 +2328,7 @@
                 }
 
                 $('#validate-rules-btn').onclick = () => {
+                    if (!canWriteSettings) return;
                     const rulesText = $('#setting-ua-rules').value.trim();
                     const errorEl = $('#ua-rules-error');
                     if (!rulesText) {
@@ -1886,6 +2365,10 @@
                     }
                 };
                 $('#save-settings-btn').onclick = async () => {
+                    if (!canWriteSettings) {
+                        showToast('当前账号无设置修改权限', 'error');
+                        return;
+                    }
                     try {
                         const days = parseInt($('#setting-retention').value) || 0;
                         const activeUaDays = parseInt($('#setting-active-ua-days').value) || 30;
@@ -1979,6 +2462,10 @@
         }
 
         async function importUARulesFromFile(file) {
+            if (!hasPermission(PERM.SETTINGS_WRITE)) {
+                showToast('当前账号无设置修改权限', 'error');
+                return;
+            }
             if (!file) return;
             try {
                 const text = await file.text();
@@ -2048,12 +2535,16 @@
         }
 
         async function login() {
+            const username = ($('#login-username')?.value || '').trim();
             const password = $('#login-password').value;
             const errorEl = $('#login-error');
             errorEl.textContent = '';
 
             try {
-                await api('/login', { method: 'POST', body: JSON.stringify({ password }) });
+                const data = await api('/login', { method: 'POST', body: JSON.stringify({ username, password }) });
+                if (data.user) {
+                    setCurrentUser(data.user);
+                }
                 showApp();
             } catch (e) {
                 errorEl.textContent = e.message || '登录失败';
@@ -2069,7 +2560,10 @@
 
         async function checkSession() {
             try {
-                await api('/status');
+                const data = await api('/status');
+                if (data.current_user) {
+                    setCurrentUser(data.current_user);
+                }
                 showApp();
             } catch (e) {
                 showLogin();

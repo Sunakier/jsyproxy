@@ -4,6 +4,7 @@ import (
 	"jsyproxy/config"
 	"jsyproxy/handlers"
 	"jsyproxy/middleware"
+	"jsyproxy/store"
 	"log"
 	"net/http"
 
@@ -37,34 +38,40 @@ func main() {
 	router.GET("/admin", subscribeHandler.AdminPage)
 	router.POST("/admin/api/login", subscribeHandler.AdminLogin)
 
-	adminAuth := middleware.AdminAuth(subscribeHandler.ValidateAdminSession)
+	adminAuth := middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission)
 	adminAPI := router.Group("/admin/api", adminAuth)
 	{
 		adminAPI.POST("/logout", subscribeHandler.AdminLogout)
-		adminAPI.GET("/status", subscribeHandler.AdminStatus)
-		adminAPI.GET("/cache-status", subscribeHandler.AdminCacheStatus)
-		adminAPI.GET("/settings", subscribeHandler.AdminGetSettings)
-		adminAPI.PUT("/settings", subscribeHandler.AdminUpdateSettings)
-		adminAPI.GET("/settings/ua-rules/export", subscribeHandler.AdminExportUARules)
-		adminAPI.POST("/settings/ua-rules/import", subscribeHandler.AdminImportUARules)
-		adminAPI.POST("/refresh", subscribeHandler.AdminManualRefresh)
+		adminAPI.GET("/status", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionAdminRead), subscribeHandler.AdminStatus)
+		adminAPI.GET("/cache-status", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionUpstreamRead), subscribeHandler.AdminCacheStatus)
+		adminAPI.GET("/settings", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionAdminRead), subscribeHandler.AdminGetSettings)
+		adminAPI.PUT("/settings", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionSettingsWrite), subscribeHandler.AdminUpdateSettings)
+		adminAPI.GET("/settings/ua-rules/export", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionAdminRead), subscribeHandler.AdminExportUARules)
+		adminAPI.POST("/settings/ua-rules/import", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionSettingsWrite), subscribeHandler.AdminImportUARules)
+		adminAPI.POST("/refresh", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionAdminWrite), subscribeHandler.AdminManualRefresh)
 
-		adminAPI.GET("/upstreams", subscribeHandler.AdminListUpstreams)
-		adminAPI.POST("/upstreams", subscribeHandler.AdminAddUpstream)
-		adminAPI.PUT("/upstreams/:id", subscribeHandler.AdminUpdateUpstream)
-		adminAPI.DELETE("/upstreams/:id", subscribeHandler.AdminDeleteUpstream)
-		adminAPI.POST("/upstreams/:id/refresh", subscribeHandler.AdminRefreshUpstream)
-		adminAPI.GET("/upstreams/:id/node-status", subscribeHandler.AdminGetUpstreamNodeStatus)
-		adminAPI.POST("/upstreams/:id/node-status/refresh", subscribeHandler.AdminRefreshUpstreamNodeStatus)
-		adminAPI.POST("/upstreams/:id/dedupe", subscribeHandler.AdminDedupeUpstreamCache)
-		adminAPI.DELETE("/upstreams/:id/ua-cache", subscribeHandler.AdminDeleteUpstreamUACache)
+		adminAPI.GET("/upstreams", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionUpstreamRead), subscribeHandler.AdminListUpstreams)
+		adminAPI.POST("/upstreams", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionUpstreamWrite), subscribeHandler.AdminAddUpstream)
+		adminAPI.PUT("/upstreams/:id", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionUpstreamWrite), subscribeHandler.AdminUpdateUpstream)
+		adminAPI.DELETE("/upstreams/:id", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionUpstreamWrite), subscribeHandler.AdminDeleteUpstream)
+		adminAPI.POST("/upstreams/:id/refresh", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionUpstreamWrite), subscribeHandler.AdminRefreshUpstream)
+		adminAPI.GET("/upstreams/:id/node-status", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionUpstreamRead), subscribeHandler.AdminGetUpstreamNodeStatus)
+		adminAPI.POST("/upstreams/:id/node-status/refresh", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionUpstreamWrite), subscribeHandler.AdminRefreshUpstreamNodeStatus)
+		adminAPI.POST("/upstreams/:id/dedupe", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionUpstreamWrite), subscribeHandler.AdminDedupeUpstreamCache)
+		adminAPI.DELETE("/upstreams/:id/ua-cache", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionUpstreamWrite), subscribeHandler.AdminDeleteUpstreamUACache)
 
-		adminAPI.GET("/keys", subscribeHandler.AdminListKeys)
-		adminAPI.POST("/keys", subscribeHandler.AdminAddKey)
-		adminAPI.PUT("/keys/:id", subscribeHandler.AdminUpdateKey)
-		adminAPI.DELETE("/keys/:id", subscribeHandler.AdminDeleteKey)
+		adminAPI.GET("/keys", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionKeyRead), subscribeHandler.AdminListKeys)
+		adminAPI.POST("/keys", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionKeyWrite), subscribeHandler.AdminAddKey)
+		adminAPI.PUT("/keys/:id", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionKeyWrite), subscribeHandler.AdminUpdateKey)
+		adminAPI.DELETE("/keys/:id", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionKeyWrite), subscribeHandler.AdminDeleteKey)
 
-		adminAPI.GET("/logs", subscribeHandler.AdminGetLogs)
+		adminAPI.GET("/users", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionUserManage), subscribeHandler.AdminListUsers)
+		adminAPI.POST("/users", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionUserManage), subscribeHandler.AdminAddUser)
+		adminAPI.PUT("/users/:id", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionUserManage), subscribeHandler.AdminUpdateUser)
+		adminAPI.PUT("/users/:id/password", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionUserManage), subscribeHandler.AdminUpdateUserPassword)
+		adminAPI.DELETE("/users/:id", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionUserManage), subscribeHandler.AdminDeleteUser)
+
+		adminAPI.GET("/logs", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionLogRead), subscribeHandler.AdminGetLogs)
 	}
 
 	// 处理所有其他路由，返回403

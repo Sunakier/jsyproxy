@@ -8,11 +8,13 @@ import (
 	"hash/fnv"
 	"io"
 	"jsyproxy/config"
+	"jsyproxy/middleware"
 	staticfiles "jsyproxy/static"
 	"jsyproxy/store"
 	"jsyproxy/utils"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +47,29 @@ type SubscribeResponse struct {
 }
 
 type loginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type addUserRequest struct {
+	Username          string   `json:"username"`
+	Password          string   `json:"password"`
+	Role              string   `json:"role"`
+	CustomPermissions []string `json:"custom_permissions"`
+	UpstreamScopeMode string   `json:"upstream_scope_mode"`
+	UpstreamScopeIDs  []string `json:"upstream_scope_ids"`
+}
+
+type updateUserRequest struct {
+	Username          string   `json:"username"`
+	Role              string   `json:"role"`
+	Enabled           bool     `json:"enabled"`
+	CustomPermissions []string `json:"custom_permissions"`
+	UpstreamScopeMode string   `json:"upstream_scope_mode"`
+	UpstreamScopeIDs  []string `json:"upstream_scope_ids"`
+}
+
+type updateUserPasswordRequest struct {
 	Password string `json:"password"`
 }
 
@@ -124,7 +149,7 @@ const (
 )
 
 func NewSubscribeHandler(cfg *config.Config) (*SubscribeHandler, error) {
-	state, err := store.New(cfg.DataFile, cfg.BootstrapAccessKeys, cfg.DefaultRefreshInterval)
+	state, err := store.New(cfg.DataFile, cfg.BootstrapAccessKeys, cfg.DefaultRefreshInterval, cfg.AdminUsername, cfg.AdminPassword)
 	if err != nil {
 		return nil, err
 	}
@@ -137,8 +162,16 @@ func NewSubscribeHandler(cfg *config.Config) (*SubscribeHandler, error) {
 	}, nil
 }
 
-func (h *SubscribeHandler) ValidateAdminSession(token string) bool {
-	return h.state.ValidateAdminSession(token)
+func (h *SubscribeHandler) ValidateAdminSession(token string) (string, string, string, bool) {
+	session, ok := h.state.ValidateAdminSession(token)
+	if !ok {
+		return "", "", "", false
+	}
+	return session.UserID, session.Username, session.Role, true
+}
+
+func (h *SubscribeHandler) HasPermission(userID, role, permission string) bool {
+	return h.state.HasPermission(userID, role, permission)
 }
 
 func (h *SubscribeHandler) StartAutoRefresh() {
@@ -419,17 +452,35 @@ func (h *SubscribeHandler) AdminLogin(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
 		return
 	}
-	if req.Password != h.config.AdminPassword {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "密码错误"})
+	username := strings.TrimSpace(req.Username)
+	if username == "" {
+		username = "admin"
+	}
+	user, err := h.state.AuthenticateAdminUser(username, req.Password)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	token, err := h.state.CreateAdminSession()
+	token, err := h.state.CreateAdminSession(user.ID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建会话失败"})
 		return
 	}
 	c.SetCookie("admin_session", token, 86400, "/admin", "", false, true)
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	effectivePermissions := h.state.EffectivePermissions(user.ID)
+	scopeMode := user.UpstreamScopeMode
+	if strings.TrimSpace(scopeMode) == "" {
+		scopeMode = store.UpstreamScopeModeAll
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "user": gin.H{
+		"id":                    user.ID,
+		"username":              user.Username,
+		"role":                  user.Role,
+		"custom_permissions":    user.CustomPermissions,
+		"effective_permissions": effectivePermissions,
+		"upstream_scope_mode":   scopeMode,
+		"upstream_scope_ids":    user.UpstreamScopeIDs,
+	}})
 }
 
 func (h *SubscribeHandler) AdminLogout(c *gin.Context) {
@@ -441,7 +492,11 @@ func (h *SubscribeHandler) AdminLogout(c *gin.Context) {
 }
 
 func (h *SubscribeHandler) AdminStatus(c *gin.Context) {
-	upstreams := h.state.ListUpstreams()
+	currentUser := h.currentAdminUser(c)
+	upstreams := h.filterUpstreamsByCurrentUser(c, h.state.ListUpstreams())
+	allowedUpstreamIDs := h.currentAllowedUpstreamIDs(c)
+	filteredKeys := h.filterKeysByCurrentUser(c, h.state.ListKeys())
+	filteredLogs := h.state.ListLogsByUpstreamScope(0, allowedUpstreamIDs)
 	upstreamStatuses := make([]gin.H, 0, len(upstreams))
 
 	for _, u := range upstreams {
@@ -486,16 +541,20 @@ func (h *SubscribeHandler) AdminStatus(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
+		"current_user":   currentUser,
 		"upstreams":      upstreamStatuses,
 		"upstream_count": len(upstreams),
-		"key_count":      len(h.state.ListKeys()),
-		"log_count":      h.state.LogCount(),
+		"key_count":      len(filteredKeys),
+		"log_count":      len(filteredLogs),
 		"global_config":  h.state.GetGlobalConfig(),
 	})
 }
 
 func (h *SubscribeHandler) AdminGetUpstreamNodeStatus(c *gin.Context) {
 	upstreamID := strings.TrimSpace(c.Param("id"))
+	if !h.ensureUpstreamAccess(c, upstreamID) {
+		return
+	}
 	upstream, ok := h.state.GetUpstream(upstreamID)
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "上游不存在"})
@@ -510,6 +569,9 @@ func (h *SubscribeHandler) AdminGetUpstreamNodeStatus(c *gin.Context) {
 
 func (h *SubscribeHandler) AdminRefreshUpstreamNodeStatus(c *gin.Context) {
 	upstreamID := strings.TrimSpace(c.Param("id"))
+	if !h.ensureUpstreamAccess(c, upstreamID) {
+		return
+	}
 	upstream, ok := h.state.GetUpstream(upstreamID)
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "上游不存在"})
@@ -524,7 +586,7 @@ func (h *SubscribeHandler) AdminRefreshUpstreamNodeStatus(c *gin.Context) {
 }
 
 func (h *SubscribeHandler) AdminCacheStatus(c *gin.Context) {
-	upstreams := h.state.ListUpstreams()
+	upstreams := h.filterUpstreamsByCurrentUser(c, h.state.ListUpstreams())
 	upstreamStatuses := make([]gin.H, 0, len(upstreams))
 	for _, u := range upstreams {
 		uaStats := h.state.GetUpstreamUACacheStatuses(u.ID)
@@ -574,10 +636,20 @@ func (h *SubscribeHandler) AdminCacheStatus(c *gin.Context) {
 }
 
 func (h *SubscribeHandler) AdminListUpstreams(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"upstreams": h.state.ListUpstreams()})
+	c.JSON(http.StatusOK, gin.H{"upstreams": h.filterUpstreamsByCurrentUser(c, h.state.ListUpstreams())})
 }
 
 func (h *SubscribeHandler) AdminAddUpstream(c *gin.Context) {
+	currentUser, ok := h.state.GetAdminUser(h.currentAdminUserID(c))
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "未登录或登录已过期"})
+		return
+	}
+	if strings.TrimSpace(currentUser.UpstreamScopeMode) == store.UpstreamScopeModeSelected {
+		c.JSON(http.StatusForbidden, gin.H{"error": "仅全上游权限用户可创建上游"})
+		return
+	}
+
 	var req upstreamRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
@@ -616,6 +688,9 @@ func (h *SubscribeHandler) AdminAddUpstream(c *gin.Context) {
 
 func (h *SubscribeHandler) AdminUpdateUpstream(c *gin.Context) {
 	upstreamID := c.Param("id")
+	if !h.ensureUpstreamAccess(c, upstreamID) {
+		return
+	}
 	existing, ok := h.state.GetUpstream(upstreamID)
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "上游不存在"})
@@ -652,6 +727,9 @@ func (h *SubscribeHandler) AdminUpdateUpstream(c *gin.Context) {
 
 func (h *SubscribeHandler) AdminDeleteUpstream(c *gin.Context) {
 	upstreamID := c.Param("id")
+	if !h.ensureUpstreamAccess(c, upstreamID) {
+		return
+	}
 	if err := h.state.DeleteUpstream(upstreamID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -662,6 +740,9 @@ func (h *SubscribeHandler) AdminDeleteUpstream(c *gin.Context) {
 
 func (h *SubscribeHandler) AdminRefreshUpstream(c *gin.Context) {
 	upstreamID := c.Param("id")
+	if !h.ensureUpstreamAccess(c, upstreamID) {
+		return
+	}
 	if err := h.RefreshUpstreamCache(upstreamID, "manual", ""); err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
@@ -675,12 +756,18 @@ func (h *SubscribeHandler) AdminRefreshUpstream(c *gin.Context) {
 
 func (h *SubscribeHandler) AdminDedupeUpstreamCache(c *gin.Context) {
 	upstreamID := c.Param("id")
+	if !h.ensureUpstreamAccess(c, upstreamID) {
+		return
+	}
 	removed, remain := h.state.DedupeCacheVariants(upstreamID)
 	c.JSON(http.StatusOK, gin.H{"ok": true, "removed": removed, "remain": remain})
 }
 
 func (h *SubscribeHandler) AdminDeleteUpstreamUACache(c *gin.Context) {
 	upstreamID := strings.TrimSpace(c.Param("id"))
+	if !h.ensureUpstreamAccess(c, upstreamID) {
+		return
+	}
 	userAgent := strings.TrimSpace(c.Query("ua"))
 	if userAgent == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少ua参数"})
@@ -708,7 +795,7 @@ func (h *SubscribeHandler) AdminDeleteUpstreamUACache(c *gin.Context) {
 func (h *SubscribeHandler) AdminGetSettings(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"global_config": h.state.GetGlobalConfig(),
-		"upstreams":     h.state.ListUpstreams(),
+		"upstreams":     h.filterUpstreamsByCurrentUser(c, h.state.ListUpstreams()),
 	})
 }
 
@@ -789,8 +876,8 @@ func (h *SubscribeHandler) AdminImportUARules(c *gin.Context) {
 }
 
 func (h *SubscribeHandler) AdminListKeys(c *gin.Context) {
-	keys := h.state.ListKeys()
-	upstreams := h.state.ListUpstreams()
+	keys := h.filterKeysByCurrentUser(c, h.state.ListKeys())
+	upstreams := h.filterUpstreamsByCurrentUser(c, h.state.ListUpstreams())
 	upstreamMap := make(map[string]string)
 	for _, u := range upstreams {
 		upstreamMap[u.ID] = u.Name
@@ -817,7 +904,19 @@ func (h *SubscribeHandler) AdminAddKey(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
 		return
 	}
-	if err := h.state.AddKey(strings.TrimSpace(req.Key), strings.TrimSpace(req.Name), strings.TrimSpace(req.UpstreamID)); err != nil {
+	upstreamID := strings.TrimSpace(req.UpstreamID)
+	if upstreamID == "" {
+		allowedUpstreams := h.filterUpstreamsByCurrentUser(c, h.state.ListUpstreams())
+		if len(allowedUpstreams) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "当前用户无可用上游"})
+			return
+		}
+		upstreamID = allowedUpstreams[0].ID
+	}
+	if !h.ensureUpstreamAccess(c, upstreamID) {
+		return
+	}
+	if err := h.state.AddKey(strings.TrimSpace(req.Key), strings.TrimSpace(req.Name), upstreamID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -831,7 +930,26 @@ func (h *SubscribeHandler) AdminUpdateKey(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
 		return
 	}
-	if err := h.state.UpdateKey(keyID, strings.TrimSpace(req.Name), req.Enabled, strings.TrimSpace(req.UpstreamID)); err != nil {
+	keys := h.state.ListKeys()
+	var currentKey *store.AccessKey
+	for i := range keys {
+		if keys[i].ID == keyID {
+			currentKey = &keys[i]
+			break
+		}
+	}
+	if currentKey == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "key不存在"})
+		return
+	}
+	if !h.ensureUpstreamAccess(c, currentKey.UpstreamID) {
+		return
+	}
+	targetUpstreamID := strings.TrimSpace(req.UpstreamID)
+	if targetUpstreamID != "" && !h.ensureUpstreamAccess(c, targetUpstreamID) {
+		return
+	}
+	if err := h.state.UpdateKey(keyID, strings.TrimSpace(req.Name), req.Enabled, targetUpstreamID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -840,7 +958,310 @@ func (h *SubscribeHandler) AdminUpdateKey(c *gin.Context) {
 
 func (h *SubscribeHandler) AdminDeleteKey(c *gin.Context) {
 	keyID := c.Param("id")
+	keys := h.state.ListKeys()
+	for _, key := range keys {
+		if key.ID != keyID {
+			continue
+		}
+		if !h.ensureUpstreamAccess(c, key.UpstreamID) {
+			return
+		}
+		break
+	}
 	if err := h.state.DeleteKey(keyID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (h *SubscribeHandler) currentAdminUserID(c *gin.Context) string {
+	value, exists := c.Get(middleware.ContextAdminUserID)
+	if !exists {
+		return ""
+	}
+	userID, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(userID)
+}
+
+func (h *SubscribeHandler) currentAdminRole(c *gin.Context) string {
+	value, exists := c.Get(middleware.ContextAdminRole)
+	if !exists {
+		return ""
+	}
+	role, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(role)
+}
+
+func (h *SubscribeHandler) currentAdminUsername(c *gin.Context) string {
+	value, exists := c.Get(middleware.ContextAdminUsername)
+	if !exists {
+		return ""
+	}
+	username, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(username)
+}
+
+func (h *SubscribeHandler) currentAdminUser(c *gin.Context) gin.H {
+	userID := h.currentAdminUserID(c)
+	allowedUpstreamIDs := h.state.UserAllowedUpstreamIDs(userID)
+	allowedUpstreamList := make([]string, 0, len(allowedUpstreamIDs))
+	for upstreamID := range allowedUpstreamIDs {
+		allowedUpstreamList = append(allowedUpstreamList, upstreamID)
+	}
+	sort.Strings(allowedUpstreamList)
+
+	permissions := h.state.EffectivePermissions(userID)
+	user, _ := h.state.GetAdminUser(userID)
+	scopeMode := strings.TrimSpace(user.UpstreamScopeMode)
+	if scopeMode == "" {
+		scopeMode = store.UpstreamScopeModeAll
+	}
+
+	return gin.H{
+		"id":                    userID,
+		"username":              h.currentAdminUsername(c),
+		"role":                  h.currentAdminRole(c),
+		"effective_permissions": permissions,
+		"custom_permissions":    user.CustomPermissions,
+		"upstream_scope_mode":   scopeMode,
+		"upstream_scope_ids":    user.UpstreamScopeIDs,
+		"allowed_upstream_ids":  allowedUpstreamList,
+	}
+}
+
+func (h *SubscribeHandler) currentAllowedUpstreamIDs(c *gin.Context) map[string]struct{} {
+	return h.state.UserAllowedUpstreamIDs(h.currentAdminUserID(c))
+}
+
+func (h *SubscribeHandler) filterUpstreamsByCurrentUser(c *gin.Context, upstreams []store.Upstream) []store.Upstream {
+	allowed := h.currentAllowedUpstreamIDs(c)
+	result := make([]store.Upstream, 0, len(upstreams))
+	for _, upstream := range upstreams {
+		if _, ok := allowed[upstream.ID]; !ok {
+			continue
+		}
+		result = append(result, upstream)
+	}
+	return result
+}
+
+func (h *SubscribeHandler) filterKeysByCurrentUser(c *gin.Context, keys []store.AccessKey) []store.AccessKey {
+	allowed := h.currentAllowedUpstreamIDs(c)
+	result := make([]store.AccessKey, 0, len(keys))
+	for _, key := range keys {
+		if _, ok := allowed[key.UpstreamID]; !ok {
+			continue
+		}
+		result = append(result, key)
+	}
+	return result
+}
+
+func (h *SubscribeHandler) ensureUpstreamAccess(c *gin.Context, upstreamID string) bool {
+	if h.state.UserCanAccessUpstream(h.currentAdminUserID(c), strings.TrimSpace(upstreamID)) {
+		return true
+	}
+	c.JSON(http.StatusForbidden, gin.H{"error": "无该上游访问权限"})
+	return false
+}
+
+func permissionsToSet(permissions []string) map[string]struct{} {
+	result := make(map[string]struct{}, len(permissions))
+	for _, permission := range permissions {
+		normalized := strings.TrimSpace(permission)
+		if normalized == "" {
+			continue
+		}
+		result[normalized] = struct{}{}
+	}
+	return result
+}
+
+func (h *SubscribeHandler) canGrantUserPolicy(c *gin.Context, role string, customPermissions []string, scopeMode string, scopeIDs []string) error {
+	callerUserID := h.currentAdminUserID(c)
+	callerUser, ok := h.state.GetAdminUser(callerUserID)
+	if !ok {
+		return errors.New("当前用户不存在")
+	}
+
+	callerPermissionSet := permissionsToSet(h.state.EffectivePermissions(callerUserID))
+	targetPermissionSet := permissionsToSet(store.RolePresetPermissions(strings.TrimSpace(role)))
+	for permission := range permissionsToSet(customPermissions) {
+		targetPermissionSet[permission] = struct{}{}
+	}
+
+	for permission := range targetPermissionSet {
+		if _, ok := callerPermissionSet[permission]; ok {
+			continue
+		}
+		return errors.New("不能授予超出自身权限的功能")
+	}
+
+	normalizedMode := strings.TrimSpace(scopeMode)
+	if normalizedMode == "" {
+		normalizedMode = store.UpstreamScopeModeAll
+	}
+	if callerUser.UpstreamScopeMode != store.UpstreamScopeModeAll {
+		if normalizedMode == store.UpstreamScopeModeAll {
+			return errors.New("不能授予全上游访问权限")
+		}
+		callerAllowed := h.currentAllowedUpstreamIDs(c)
+		for _, upstreamID := range scopeIDs {
+			if _, ok := callerAllowed[strings.TrimSpace(upstreamID)]; ok {
+				continue
+			}
+			return errors.New("不能授予超出自身范围的上游")
+		}
+	}
+
+	return nil
+}
+
+func (h *SubscribeHandler) AdminListUsers(c *gin.Context) {
+	users := h.state.ListAdminUsers()
+	result := make([]gin.H, 0, len(users))
+	for _, user := range users {
+		effectivePermissions := store.RolePresetPermissions(user.Role)
+		customPermissions := append([]string(nil), user.CustomPermissions...)
+		if len(customPermissions) > 0 {
+			effectiveSet := make(map[string]struct{}, len(effectivePermissions)+len(customPermissions))
+			for _, permission := range effectivePermissions {
+				effectiveSet[permission] = struct{}{}
+			}
+			for _, permission := range customPermissions {
+				effectiveSet[permission] = struct{}{}
+			}
+			effectivePermissions = make([]string, 0, len(effectiveSet))
+			for permission := range effectiveSet {
+				effectivePermissions = append(effectivePermissions, permission)
+			}
+			sort.Strings(effectivePermissions)
+		}
+		scopeMode := user.UpstreamScopeMode
+		if strings.TrimSpace(scopeMode) == "" {
+			scopeMode = store.UpstreamScopeModeAll
+		}
+		result = append(result, gin.H{
+			"id":                    user.ID,
+			"username":              user.Username,
+			"role":                  user.Role,
+			"enabled":               user.Enabled,
+			"custom_permissions":    customPermissions,
+			"effective_permissions": effectivePermissions,
+			"upstream_scope_mode":   scopeMode,
+			"upstream_scope_ids":    user.UpstreamScopeIDs,
+			"created_at":            user.CreatedAt,
+			"updated_at":            user.UpdatedAt,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"users":                result,
+		"all_permissions":      store.AllPermissions(),
+		"role_permissions":     gin.H{"super_admin": store.RolePresetPermissions(store.AdminRoleSuperAdmin), "operator": store.RolePresetPermissions(store.AdminRoleOperator), "viewer": store.RolePresetPermissions(store.AdminRoleViewer)},
+		"upstream_scope_modes": []string{store.UpstreamScopeModeAll, store.UpstreamScopeModeSelected},
+		"upstreams":            h.filterUpstreamsByCurrentUser(c, h.state.ListUpstreams()),
+	})
+}
+
+func (h *SubscribeHandler) AdminAddUser(c *gin.Context) {
+	var req addUserRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
+		return
+	}
+	if err := h.canGrantUserPolicy(c, strings.TrimSpace(req.Role), req.CustomPermissions, strings.TrimSpace(req.UpstreamScopeMode), req.UpstreamScopeIDs); err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.state.AddAdminUser(
+		strings.TrimSpace(req.Username),
+		req.Password,
+		strings.TrimSpace(req.Role),
+		req.CustomPermissions,
+		strings.TrimSpace(req.UpstreamScopeMode),
+		req.UpstreamScopeIDs,
+	); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (h *SubscribeHandler) AdminUpdateUser(c *gin.Context) {
+	userID := strings.TrimSpace(c.Param("id"))
+	if userID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "用户ID不能为空"})
+		return
+	}
+	var req updateUserRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
+		return
+	}
+	currentUserID := h.currentAdminUserID(c)
+	if currentUserID != "" && currentUserID == userID && !req.Enabled {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "不能禁用当前登录用户"})
+		return
+	}
+	if err := h.canGrantUserPolicy(c, strings.TrimSpace(req.Role), req.CustomPermissions, strings.TrimSpace(req.UpstreamScopeMode), req.UpstreamScopeIDs); err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.state.UpdateAdminUser(
+		userID,
+		strings.TrimSpace(req.Username),
+		strings.TrimSpace(req.Role),
+		req.Enabled,
+		req.CustomPermissions,
+		strings.TrimSpace(req.UpstreamScopeMode),
+		req.UpstreamScopeIDs,
+	); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (h *SubscribeHandler) AdminUpdateUserPassword(c *gin.Context) {
+	userID := strings.TrimSpace(c.Param("id"))
+	if userID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "用户ID不能为空"})
+		return
+	}
+	var req updateUserPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
+		return
+	}
+	if err := h.state.UpdateAdminUserPassword(userID, req.Password); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (h *SubscribeHandler) AdminDeleteUser(c *gin.Context) {
+	userID := strings.TrimSpace(c.Param("id"))
+	if userID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "用户ID不能为空"})
+		return
+	}
+	currentUserID := h.currentAdminUserID(c)
+	if currentUserID != "" && currentUserID == userID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "不能删除当前登录用户"})
+		return
+	}
+	if err := h.state.DeleteAdminUser(userID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -862,19 +1283,20 @@ func (h *SubscribeHandler) AdminGetLogs(c *gin.Context) {
 		}
 	}
 
+	allowedUpstreamIDs := h.currentAllowedUpstreamIDs(c)
 	if raw := c.Query("limit"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
-			c.JSON(http.StatusOK, gin.H{"logs": h.state.ListLogs(parsed)})
+			c.JSON(http.StatusOK, gin.H{"logs": h.state.ListLogsByUpstreamScope(parsed, allowedUpstreamIDs)})
 			return
 		}
 	}
 
-	result := h.state.ListLogsPaginated(page, pageSize)
+	result := h.state.ListLogsPaginatedByUpstreamScope(page, pageSize, allowedUpstreamIDs)
 	c.JSON(http.StatusOK, result)
 }
 
 func (h *SubscribeHandler) AdminManualRefresh(c *gin.Context) {
-	upstreams := h.state.ListUpstreams()
+	upstreams := h.filterUpstreamsByCurrentUser(c, h.state.ListUpstreams())
 	var lastErr error
 	refreshed := 0
 	for _, u := range upstreams {

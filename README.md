@@ -31,6 +31,7 @@ docker-compose up -d
 |--------|--------|------|
 | `PORT` | 3000 | HTTP服务监听端口 |
 | `ACCESS_KEYS` | 空 | 可选：启动时预置多Key（逗号分隔） |
+| `ADMIN_USERNAME` | admin | 初始超级管理员用户名（仅首次初始化生效） |
 | `ADMIN_PASSWORD` | 无 | 后台登录密码（必填） |
 | `DEFAULT_REFRESH_INTERVAL` | 10m | 默认刷新周期（支持 `10m`/`5m`/`125s`） |
 | `DATA_FILE` | data/state.json | Key和日志持久化文件 |
@@ -80,7 +81,27 @@ go run main.go
   - `GET /admin/api/keys`
   - `POST /admin/api/keys`
   - `DELETE /admin/api/keys/:key`
+  - `GET /admin/api/users`
+  - `POST /admin/api/users`
+  - `PUT /admin/api/users/:id`
+  - `PUT /admin/api/users/:id/password`
+  - `DELETE /admin/api/users/:id`
   - `GET /admin/api/logs`
+
+## 多用户与权限模型
+
+- 角色：`super_admin`、`operator`、`viewer`
+- 登录接口支持：
+
+```json
+{
+  "username": "admin",
+  "password": "your_password"
+}
+```
+
+- 若 `username` 为空，默认按 `admin` 登录（兼容旧版前端）
+- 首次启动时会使用 `ADMIN_USERNAME` + `ADMIN_PASSWORD` 自动创建默认超级管理员
 
 ## 错误码
 

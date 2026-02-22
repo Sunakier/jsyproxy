@@ -10,6 +10,7 @@ import (
 
 type Config struct {
 	Port                   string
+	AdminUsername          string
 	AdminPassword          string
 	DataFile               string
 	DefaultRefreshInterval string
@@ -22,6 +23,7 @@ func Load() *Config {
 
 	config := &Config{
 		Port:                   getEnv("PORT", "3000"),
+		AdminUsername:          getEnv("ADMIN_USERNAME", "admin"),
 		AdminPassword:          getEnv("ADMIN_PASSWORD", ""),
 		DataFile:               getEnv("DATA_FILE", "data/state.json"),
 		DefaultRefreshInterval: getEnv("DEFAULT_REFRESH_INTERVAL", "10m"),
