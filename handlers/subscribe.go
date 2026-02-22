@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -74,8 +76,9 @@ type upstreamRequest struct {
 }
 
 type globalConfigRequest struct {
-	LogRetentionDays int `json:"log_retention_days"`
-	ActiveUADays     int `json:"active_ua_days"`
+	LogRetentionDays int                         `json:"log_retention_days"`
+	ActiveUADays     int                         `json:"active_ua_days"`
+	UANormalization  store.UANormalizationConfig `json:"ua_normalization"`
 }
 
 type SubscribeHandler struct {
@@ -84,6 +87,14 @@ type SubscribeHandler struct {
 	state        *store.State
 	refreshMutex sync.Map
 }
+
+// refreshLockValue holds the wait group for contended refreshes
+type refreshLockValue struct {
+	wg       sync.WaitGroup
+	doneChan chan struct{}
+}
+
+const refreshContentionTimeout = 10 * time.Second
 
 func NewSubscribeHandler(cfg *config.Config) (*SubscribeHandler, error) {
 	state, err := store.New(cfg.DataFile, cfg.BootstrapAccessKeys, cfg.DefaultRefreshInterval)
@@ -173,8 +184,9 @@ func (h *SubscribeHandler) GetSubscribe(c *gin.Context) {
 	clientIP := c.ClientIP()
 	h.state.MarkUASeen(keyInfo.UpstreamID, clientUA)
 	clientUA = strings.TrimSpace(clientUA)
+	uaDetails := h.state.ResolveUAMatchDetails(clientUA)
 
-	cacheVariantUA := clientUA
+	cacheVariantUA := uaDetails.CacheBucket
 	cache, cacheHit := h.state.GetCache(keyInfo.UpstreamID, cacheVariantUA)
 	variantMiss := cacheVariantUA != "" && !cacheHit
 	if !cacheHit && cacheVariantUA != "" {
@@ -200,7 +212,7 @@ func (h *SubscribeHandler) GetSubscribe(c *gin.Context) {
 			refreshUA = ""
 		}
 		if err := h.RefreshUpstreamCache(keyInfo.UpstreamID, "request", refreshUA); err != nil {
-			h.appendClientLog(keyInfo.ID, keyInfo.Key, keyInfo.Name, keyInfo.UpstreamID, clientIP, clientUA, false, "failed", err.Error())
+			h.appendClientLog(keyInfo.ID, keyInfo.Key, keyInfo.Name, keyInfo.UpstreamID, clientIP, clientUA, uaDetails, false, "failed", err.Error())
 			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 			return
 		}
@@ -209,7 +221,7 @@ func (h *SubscribeHandler) GetSubscribe(c *gin.Context) {
 			cache, cacheHit = h.state.GetCache(keyInfo.UpstreamID, "")
 		}
 		if !cacheHit {
-			h.appendClientLog(keyInfo.ID, keyInfo.Key, keyInfo.Name, keyInfo.UpstreamID, clientIP, clientUA, false, "failed", "缓存刷新后为空")
+			h.appendClientLog(keyInfo.ID, keyInfo.Key, keyInfo.Name, keyInfo.UpstreamID, clientIP, clientUA, uaDetails, false, "failed", "缓存刷新后为空")
 			c.JSON(http.StatusBadGateway, gin.H{"error": "订阅内容不可用"})
 			return
 		}
@@ -218,18 +230,32 @@ func (h *SubscribeHandler) GetSubscribe(c *gin.Context) {
 	copyHeaders(cache.Headers, c.Writer.Header())
 	c.Status(cache.StatusCode)
 	if _, err := c.Writer.Write(cache.Body); err != nil {
-		h.appendClientLog(keyInfo.ID, keyInfo.Key, keyInfo.Name, keyInfo.UpstreamID, clientIP, clientUA, cacheHit, "failed", "写响应失败")
+		h.appendClientLog(keyInfo.ID, keyInfo.Key, keyInfo.Name, keyInfo.UpstreamID, clientIP, clientUA, uaDetails, cacheHit, "failed", "写响应失败")
 		return
 	}
-	h.appendClientLog(keyInfo.ID, keyInfo.Key, keyInfo.Name, keyInfo.UpstreamID, clientIP, clientUA, cacheHit, "success", "")
+	h.appendClientLog(keyInfo.ID, keyInfo.Key, keyInfo.Name, keyInfo.UpstreamID, clientIP, clientUA, uaDetails, cacheHit, "success", "")
 }
 
 func (h *SubscribeHandler) RefreshUpstreamCache(upstreamID, reason, downstreamUA string) error {
-	lockKey := makeRefreshLockKey(upstreamID, downstreamUA)
-	if _, loaded := h.refreshMutex.LoadOrStore(lockKey, true); loaded {
-		return nil
+	variantKey := h.state.NormalizeUAVariant(downstreamUA)
+	lockKey := makeRefreshLockKey(upstreamID, variantKey)
+
+	// Try to acquire lock or wait for in-flight refresh
+	lockVal := h.acquireRefreshLock(lockKey)
+	if lockVal == nil {
+		// Another goroutine is refreshing - wait for it to complete
+		select {
+		case <-time.After(refreshContentionTimeout):
+			return errors.New("等待上游刷新超时，请稍后重试")
+		case <-h.waitForRefresh(lockKey):
+			// In-flight refresh completed - check if cache now exists
+			if cache, hit := h.state.GetCache(upstreamID, variantKey); hit && cache != nil {
+				return nil
+			}
+			return errors.New("上游刷新未完成，缓存不可用")
+		}
 	}
-	defer h.refreshMutex.Delete(lockKey)
+	defer h.releaseRefreshLock(lockKey, lockVal)
 
 	upstream, ok := h.state.GetUpstream(upstreamID)
 	if !ok {
@@ -335,6 +361,39 @@ func makeRefreshLockKey(upstreamID, userAgent string) string {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(ua))
 	return fmt.Sprintf("refresh_%s_%x", upstreamID, h.Sum64())
+}
+
+// acquireRefreshLock attempts to acquire the refresh lock for the given key.
+// Returns nil if another goroutine is already refreshing (caller should wait).
+// Returns the lock value if this goroutine acquired the lock (caller should refresh).
+func (h *SubscribeHandler) acquireRefreshLock(lockKey string) *refreshLockValue {
+	lockVal, loaded := h.refreshMutex.LoadOrStore(lockKey, &refreshLockValue{
+		doneChan: make(chan struct{}),
+	})
+	if loaded {
+		return nil
+	}
+	// We acquired the lock - initialize the wait group for others to wait on
+	lockVal.(*refreshLockValue).wg.Add(1)
+	return lockVal.(*refreshLockValue)
+}
+
+// waitForRefresh returns a channel that signals when the in-flight refresh completes.
+func (h *SubscribeHandler) waitForRefresh(lockKey string) <-chan struct{} {
+	lockVal, ok := h.refreshMutex.Load(lockKey)
+	if !ok {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	return lockVal.(*refreshLockValue).doneChan
+}
+
+// releaseRefreshLock releases the refresh lock and signals waiting goroutines.
+func (h *SubscribeHandler) releaseRefreshLock(lockKey string, lockVal *refreshLockValue) {
+	lockVal.wg.Done()
+	close(lockVal.doneChan)
+	h.refreshMutex.Delete(lockKey)
 }
 
 func (h *SubscribeHandler) AdminPage(c *gin.Context) {
@@ -577,11 +636,19 @@ func (h *SubscribeHandler) AdminGetSettings(c *gin.Context) {
 
 func (h *SubscribeHandler) AdminUpdateSettings(c *gin.Context) {
 	var req globalConfigRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	// Use custom JSON decoder to reject unknown fields
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
 		return
 	}
-	if err := h.state.UpdateGlobalConfig(store.GlobalConfig{LogRetentionDays: req.LogRetentionDays, ActiveUADays: req.ActiveUADays}); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
+		return
+	}
+	if err := h.state.UpdateGlobalConfig(store.GlobalConfig{LogRetentionDays: req.LogRetentionDays, ActiveUADays: req.ActiveUADays, UANormalization: req.UANormalization}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存配置失败"})
 		return
 	}
@@ -696,18 +763,22 @@ func (h *SubscribeHandler) AdminManualRefresh(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "refreshed": refreshed})
 }
 
-func (h *SubscribeHandler) appendClientLog(keyID, keyToken, keyName, upstreamID, clientIP, userAgent string, cacheHit bool, status, message string) {
+func (h *SubscribeHandler) appendClientLog(keyID, keyToken, keyName, upstreamID, clientIP, userAgent string, uaDetails store.UAMatchDetails, cacheHit bool, status, message string) {
 	entry := store.ClientUpdateLog{
-		Time:       time.Now(),
-		KeyID:      keyID,
-		Key:        keyToken,
-		KeyName:    keyName,
-		UpstreamID: upstreamID,
-		ClientIP:   clientIP,
-		UserAgent:  userAgent,
-		CacheHit:   cacheHit,
-		Status:     status,
-		Message:    message,
+		Time:        time.Now(),
+		KeyID:       keyID,
+		Key:         keyToken,
+		KeyName:     keyName,
+		UpstreamID:  upstreamID,
+		ClientIP:    clientIP,
+		UserAgent:   userAgent,
+		UARule:      uaDetails.Rule,
+		UAVariant:   uaDetails.Variant,
+		UAFamily:    uaDetails.Family,
+		CacheBucket: uaDetails.CacheBucket,
+		CacheHit:    cacheHit,
+		Status:      status,
+		Message:     message,
 	}
 	if err := h.state.AppendClientLog(entry); err != nil {
 		log.Printf("写入客户端日志失败: %v", err)

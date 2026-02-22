@@ -23,6 +23,7 @@ const (
 	CacheStrategyForce          = "force"
 	CacheStrategyLazy           = "lazy"
 	cacheVariantDefault         = "__default__"
+	cacheVariantUnknown         = "__unknown__"
 	maxTrackedUAVariants        = 100
 	maxCacheVariantsPerUpstream = maxTrackedUAVariants + 1
 	defaultActiveUADays         = 30
@@ -54,16 +55,28 @@ type AccessKey struct {
 }
 
 type ClientUpdateLog struct {
-	Time       time.Time `json:"time"`
-	KeyID      string    `json:"key_id"`
-	Key        string    `json:"key"`
-	KeyName    string    `json:"key_name"`
-	UpstreamID string    `json:"upstream_id"`
-	ClientIP   string    `json:"client_ip"`
-	UserAgent  string    `json:"user_agent"`
-	CacheHit   bool      `json:"cache_hit"`
-	Status     string    `json:"status"`
-	Message    string    `json:"message"`
+	Time        time.Time `json:"time"`
+	KeyID       string    `json:"key_id"`
+	Key         string    `json:"key"`
+	KeyName     string    `json:"key_name"`
+	UpstreamID  string    `json:"upstream_id"`
+	ClientIP    string    `json:"client_ip"`
+	UserAgent   string    `json:"user_agent"`
+	UARule      string    `json:"ua_rule,omitempty"`
+	UAVariant   string    `json:"ua_variant,omitempty"`
+	UAFamily    string    `json:"ua_family,omitempty"`
+	CacheBucket string    `json:"cache_bucket,omitempty"`
+	CacheHit    bool      `json:"cache_hit"`
+	Status      string    `json:"status"`
+	Message     string    `json:"message"`
+}
+
+type UAMatchDetails struct {
+	UserAgent   string
+	Rule        string
+	Variant     string
+	Family      string
+	CacheBucket string
 }
 
 type TrafficStatus struct {
@@ -76,8 +89,22 @@ type TrafficStatus struct {
 }
 
 type GlobalConfig struct {
-	LogRetentionDays int `json:"log_retention_days"`
-	ActiveUADays     int `json:"active_ua_days"`
+	LogRetentionDays int                   `json:"log_retention_days"`
+	ActiveUADays     int                   `json:"active_ua_days"`
+	UANormalization  UANormalizationConfig `json:"ua_normalization"`
+}
+
+type UANormalizationConfig struct {
+	Enabled            bool                  `json:"enabled"`
+	UnknownPassthrough bool                  `json:"unknown_passthrough"`
+	Rules              []UANormalizationRule `json:"rules"`
+}
+
+type UANormalizationRule struct {
+	CanonicalClass string   `json:"canonical_class"`
+	BucketKey      string   `json:"bucket_key"`
+	AllContains    []string `json:"all_contains,omitempty"`
+	AnyContains    []string `json:"any_contains,omitempty"`
 }
 
 type CachedSubscription struct {
@@ -132,7 +159,7 @@ func New(dataFile string, initialKeys []string, defaultRefreshInterval string) (
 		uaSeen:        make(map[string]map[string]time.Time),
 		adminSessions: make(map[string]time.Time),
 		dataFile:      dataFile,
-		config:        GlobalConfig{ActiveUADays: defaultActiveUADays},
+		config:        GlobalConfig{ActiveUADays: defaultActiveUADays, UANormalization: defaultUANormalizationConfig()},
 	}
 
 	if err := s.load(); err != nil {
@@ -141,9 +168,11 @@ func New(dataFile string, initialKeys []string, defaultRefreshInterval string) (
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.config.ActiveUADays <= 0 {
-		s.config.ActiveUADays = defaultActiveUADays
+	normalizedConfig, err := normalizeGlobalConfig(s.config)
+	if err != nil {
+		return nil, err
 	}
+	s.config = normalizedConfig
 
 	if len(s.upstreams) == 0 {
 		defaultUpstream := Upstream{
@@ -294,12 +323,217 @@ func (s *State) DeleteKey(keyID string) error {
 	return s.saveLocked()
 }
 
-func normalizeUAVariant(userAgent string) string {
+func defaultUANormalizationConfig() UANormalizationConfig {
+	return UANormalizationConfig{
+		Enabled:            true,
+		UnknownPassthrough: true,
+		Rules: []UANormalizationRule{
+			{
+				CanonicalClass: "clashforandroid_premium",
+				BucketKey:      "clashforandroid_premium",
+				AllContains:    []string{"clashforandroid", "premium"},
+			},
+			{
+				CanonicalClass: "clashforandroid_mihomo",
+				BucketKey:      "clashforandroid_mihomo",
+				AllContains:    []string{"clashforandroid", "mihomo"},
+			},
+			{
+				CanonicalClass: "clashforandroid_meta",
+				BucketKey:      "clashforandroid_meta",
+				AllContains:    []string{"clashforandroid", "meta"},
+			},
+			{
+				CanonicalClass: "clash_meta_core",
+				BucketKey:      "clash_meta_core",
+				AnyContains:    []string{"flclash", "clash-verge"},
+			},
+			{
+				CanonicalClass: "v2ray_family",
+				BucketKey:      "v2ray_family",
+				AnyContains:    []string{"v2rayn", "v2raya", "v2rayng"},
+			},
+		},
+	}
+}
+
+func normalizeTokens(tokens []string) []string {
+	if len(tokens) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(tokens))
+	result := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		normalized := strings.ToLower(strings.TrimSpace(token))
+		if normalized == "" {
+			continue
+		}
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		result = append(result, normalized)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func normalizeUANormalizationConfig(config UANormalizationConfig) (UANormalizationConfig, error) {
+	if config.Rules == nil && !config.Enabled && !config.UnknownPassthrough {
+		return defaultUANormalizationConfig(), nil
+	}
+	if config.Rules == nil {
+		config.Rules = defaultUANormalizationConfig().Rules
+	}
+	normalizedRules := make([]UANormalizationRule, 0, len(config.Rules))
+	for idx, rule := range config.Rules {
+		rule.CanonicalClass = strings.TrimSpace(rule.CanonicalClass)
+		rule.BucketKey = strings.TrimSpace(rule.BucketKey)
+		if rule.CanonicalClass == "" {
+			return UANormalizationConfig{}, fmt.Errorf("ua_normalization.rules[%d].canonical_class不能为空", idx)
+		}
+		if rule.BucketKey == "" {
+			return UANormalizationConfig{}, fmt.Errorf("ua_normalization.rules[%d].bucket_key不能为空", idx)
+		}
+		rule.AllContains = normalizeTokens(rule.AllContains)
+		rule.AnyContains = normalizeTokens(rule.AnyContains)
+		if len(rule.AllContains) == 0 && len(rule.AnyContains) == 0 {
+			return UANormalizationConfig{}, fmt.Errorf("ua_normalization.rules[%d]至少需要all_contains或any_contains", idx)
+		}
+		normalizedRules = append(normalizedRules, rule)
+	}
+	config.Rules = normalizedRules
+	return config, nil
+}
+
+func normalizeGlobalConfig(config GlobalConfig) (GlobalConfig, error) {
+	if config.ActiveUADays <= 0 {
+		config.ActiveUADays = defaultActiveUADays
+	}
+	uaConfig, err := normalizeUANormalizationConfig(config.UANormalization)
+	if err != nil {
+		return GlobalConfig{}, err
+	}
+	config.UANormalization = uaConfig
+	return config, nil
+}
+
+func uaRuleMatches(lowerUA string, rule UANormalizationRule) bool {
+	for _, token := range rule.AllContains {
+		if !strings.Contains(lowerUA, token) {
+			return false
+		}
+	}
+	if len(rule.AnyContains) == 0 {
+		return true
+	}
+	for _, token := range rule.AnyContains {
+		if strings.Contains(lowerUA, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func mapRawUAToCanonicalClass(userAgent string, config UANormalizationConfig) (string, *UANormalizationRule) {
+	ua := strings.TrimSpace(userAgent)
+	if ua == "" {
+		return cacheVariantDefault, nil
+	}
+	if !config.Enabled {
+		return ua, nil
+	}
+	lowerUA := strings.ToLower(ua)
+	for idx := range config.Rules {
+		rule := &config.Rules[idx]
+		if uaRuleMatches(lowerUA, *rule) {
+			return rule.CanonicalClass, rule
+		}
+	}
+	if config.UnknownPassthrough {
+		return ua, nil
+	}
+	return cacheVariantUnknown, nil
+}
+
+func mapCanonicalClassToBucketKey(userAgent, canonicalClass string, matchedRule *UANormalizationRule) string {
+	if canonicalClass == cacheVariantDefault {
+		return cacheVariantDefault
+	}
+	if matchedRule != nil {
+		bucket := strings.TrimSpace(matchedRule.BucketKey)
+		if bucket != "" {
+			return bucket
+		}
+	}
+	if strings.TrimSpace(canonicalClass) != "" {
+		return canonicalClass
+	}
 	ua := strings.TrimSpace(userAgent)
 	if ua == "" {
 		return cacheVariantDefault
 	}
 	return ua
+}
+
+func normalizeUAVariant(userAgent string, config UANormalizationConfig) string {
+	return resolveUAMatchDetails(userAgent, config).CacheBucket
+}
+
+func resolveUAMatchDetails(userAgent string, config UANormalizationConfig) UAMatchDetails {
+	ua := strings.TrimSpace(userAgent)
+	canonicalClass, matchedRule := mapRawUAToCanonicalClass(ua, config)
+	bucket := mapCanonicalClassToBucketKey(ua, canonicalClass, matchedRule)
+
+	rule := canonicalClass
+	if matchedRule != nil {
+		rule = strings.TrimSpace(matchedRule.CanonicalClass)
+	} else {
+		switch {
+		case canonicalClass == cacheVariantDefault:
+			rule = "default"
+		case canonicalClass == cacheVariantUnknown:
+			rule = "unknown"
+		case !config.Enabled:
+			rule = "normalization_disabled"
+		case ua != "" && canonicalClass == ua:
+			rule = "passthrough"
+		}
+	}
+
+	family := bucket
+	if matchedRule != nil {
+		candidate := strings.TrimSpace(matchedRule.BucketKey)
+		if candidate != "" {
+			family = candidate
+		}
+	}
+
+	return UAMatchDetails{
+		UserAgent:   ua,
+		Rule:        rule,
+		Variant:     canonicalClass,
+		Family:      family,
+		CacheBucket: bucket,
+	}
+}
+
+func (s *State) normalizeUAVariantLocked(userAgent string) string {
+	return normalizeUAVariant(userAgent, s.config.UANormalization)
+}
+
+func (s *State) NormalizeUAVariant(userAgent string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return normalizeUAVariant(userAgent, s.config.UANormalization)
+}
+
+func (s *State) ResolveUAMatchDetails(userAgent string) UAMatchDetails {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return resolveUAMatchDetails(userAgent, s.config.UANormalization)
 }
 
 func (s *State) SetCache(upstreamID, userAgent string, cache *CachedSubscription) {
@@ -308,7 +542,7 @@ func (s *State) SetCache(upstreamID, userAgent string, cache *CachedSubscription
 	if cache == nil {
 		return
 	}
-	uaKey := normalizeUAVariant(userAgent)
+	uaKey := s.normalizeUAVariantLocked(userAgent)
 	bucket, ok := s.caches[upstreamID]
 	if !ok || bucket == nil {
 		bucket = make(map[string]*CachedSubscription)
@@ -352,7 +586,7 @@ func (s *State) GetCache(upstreamID, userAgent string) (*CachedSubscription, boo
 	if !ok || bucket == nil {
 		return nil, false
 	}
-	uaKey := normalizeUAVariant(userAgent)
+	uaKey := s.normalizeUAVariantLocked(userAgent)
 	cache, ok := bucket[uaKey]
 	if !ok || cache == nil {
 		return nil, false
@@ -396,7 +630,7 @@ func (s *State) MarkUASeen(upstreamID, userAgent string) {
 	if strings.TrimSpace(upstreamID) == "" {
 		return
 	}
-	uaKey := normalizeUAVariant(userAgent)
+	uaKey := s.NormalizeUAVariant(userAgent)
 	if uaKey == cacheVariantDefault {
 		return
 	}
@@ -497,7 +731,7 @@ func (s *State) GetUpstreamUACacheStatuses(upstreamID string) []UACacheStatus {
 		if entry.UpstreamID != upstreamID {
 			continue
 		}
-		uaKey := normalizeUAVariant(entry.UserAgent)
+		uaKey := s.normalizeUAVariantLocked(entry.UserAgent)
 		item := requestStats[uaKey]
 		item.total++
 		if !entry.Time.Before(todayStart) {
@@ -728,11 +962,17 @@ func (s *State) GetGlobalConfig() GlobalConfig {
 func (s *State) UpdateGlobalConfig(next GlobalConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if next.ActiveUADays <= 0 {
-		next.ActiveUADays = defaultActiveUADays
+	normalized, err := normalizeGlobalConfig(next)
+	if err != nil {
+		return err
 	}
-	s.config = next
-	return s.saveLocked()
+	oldConfig := s.config
+	s.config = normalized
+	if err := s.saveLocked(); err != nil {
+		s.config = oldConfig
+		return err
+	}
+	return nil
 }
 
 func (s *State) ListUpstreams() []Upstream {
@@ -840,7 +1080,7 @@ func (s *State) IsCacheExpired(upstreamID, userAgent string) bool {
 	if !ok || bucket == nil {
 		return true
 	}
-	cache, ok := bucket[normalizeUAVariant(userAgent)]
+	cache, ok := bucket[s.normalizeUAVariantLocked(userAgent)]
 	if !ok || cache == nil {
 		return true
 	}
@@ -916,10 +1156,11 @@ func (s *State) load() error {
 	}
 
 	s.logs = persisted.Logs
-	s.config = persisted.Config
-	if s.config.ActiveUADays <= 0 {
-		s.config.ActiveUADays = defaultActiveUADays
+	normalizedConfig, err := normalizeGlobalConfig(persisted.Config)
+	if err != nil {
+		return err
 	}
+	s.config = normalizedConfig
 	if persisted.UASeen != nil {
 		s.uaSeen = make(map[string]map[string]time.Time, len(persisted.UASeen))
 		for upstreamID, variants := range persisted.UASeen {

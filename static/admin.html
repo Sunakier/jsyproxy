@@ -1196,13 +1196,13 @@
                             <div class="table-container">
                                 <table>
                                     <thead>
-                                        <tr><th>Time</th><th>Key</th><th>IP</th><th>Cache</th><th>Status</th></tr>
+                                        <tr><th>Time</th><th>Key</th><th>IP</th><th>UA</th><th>Rule</th><th>Variant</th><th>Family</th><th>Cache</th><th>Status</th><th>Message</th></tr>
                                     </thead>
                                     <tbody>
                 `;
                 
                 if (logs.length === 0) {
-                    html += '<tr><td colspan="5" class="text-muted" style="text-align:center; padding: 2rem;">No logs available</td></tr>';
+                    html += '<tr><td colspan="10" class="text-muted" style="text-align:center; padding: 2rem;">No logs available</td></tr>';
                 } else {
                     logs.forEach(l => {
                         const cacheHit = l.cache_hit 
@@ -1218,8 +1218,13 @@
                                 <td class="text-sm">${l.time ? new Date(l.time).toLocaleString() : '-'}</td>
                                 <td class="text-sm"><strong>${escapeHtml(keyDisplay)}</strong></td>
                                 <td class="text-sm"><span class="code-box">${escapeHtml(l.client_ip || '-')}</span></td>
+                                <td class="text-sm"><span class="code-box">${escapeHtml(l.user_agent || '-')}</span></td>
+                                <td class="text-sm">${escapeHtml(l.ua_rule || '-')}</td>
+                                <td class="text-sm">${escapeHtml(l.ua_variant || '-')}</td>
+                                <td class="text-sm">${escapeHtml(l.ua_family || l.cache_bucket || '-')}</td>
                                 <td>${cacheHit}</td>
                                 <td>${statusBadge}</td>
+                                <td class="text-sm">${escapeHtml(l.message || '-')}</td>
                             </tr>
                         `;
                     });
@@ -1249,11 +1254,11 @@
         async function renderSettings() {
             const content = $('#content-area');
             content.innerHTML = '<div class="text-muted">加载中...</div>';
-
             try {
                 const data = await api('/settings');
                 const config = data.global_config || {};
-
+                const uaNorm = config.ua_normalization || {};
+                const rulesJson = uaNorm.rules ? JSON.stringify(uaNorm.rules, null, 2) : '[]';
                 content.innerHTML = `
                     <div class="dash-card">
                         <div class="dash-card-header">
@@ -1270,20 +1275,118 @@
                                 <input type="number" class="input" id="setting-active-ua-days" value="${config.active_ua_days || 30}" min="1" style="max-width: 200px;">
                                 <div class="form-hint">强制缓存模式会刷新最近该天数内出现过的UA缓存变体。</div>
                             </div>
+                            <hr style="border: none; border-top: 1px solid var(--border); margin: 1.5rem 0;">
+                            <div class="form-group">
+                                <label class="form-label flex items-center gap-2">
+                                    <input type="checkbox" id="setting-ua-enabled" ${uaNorm.enabled ? 'checked' : ''}>
+                                    启用UA归一化
+                                </label>
+                                <div class="form-hint">启用后将根据规则对User-Agent进行归一化处理，减少缓存变体数量。</div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label flex items-center gap-2">
+                                    <input type="checkbox" id="setting-ua-unknown-passthrough" ${uaNorm.unknown_passthrough ? 'checked' : ''}>
+                                    未知UA透传
+                                </label>
+                                <div class="form-hint">不匹配任何规则的UA将原样透传，否则使用默认归一化结果。</div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">归一化规则</label>
+                                <textarea class="input" id="setting-ua-rules" rows="10" style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.85rem;">${escapeHtml(rulesJson)}</textarea>
+                                <div class="form-hint">JSON格式的规则数组。每条规则需要 canonical_class, bucket_key, 以及 all_contains 或 any_contains。</div>
+                                <div id="ua-rules-error" class="text-danger text-sm mt-4 hidden"></div>
+                            </div>
                         </div>
                         <div class="dash-card-footer">
                             <div class="dash-actions">
+                                <button class="btn btn-secondary" id="validate-rules-btn">验证规则</button>
                                 <button class="btn btn-primary" id="save-settings-btn">保存设置</button>
                             </div>
                         </div>
                     </div>
                 `;
 
+                $('#validate-rules-btn').onclick = () => {
+                    const rulesText = $('#setting-ua-rules').value.trim();
+                    const errorEl = $('#ua-rules-error');
+                    if (!rulesText) {
+                        errorEl.textContent = '';
+                        errorEl.classList.add('hidden');
+                        showToast('规则为空，无需验证', 'info');
+                        return;
+                    }
+                    try {
+                        const rules = JSON.parse(rulesText);
+                        if (!Array.isArray(rules)) {
+                            throw new Error('规则必须是数组');
+                        }
+                        // Validate each rule
+                        for (let i = 0; i < rules.length; i++) {
+                            const r = rules[i];
+                            if (!r.canonical_class) {
+                                throw new Error(`规则[${i}]: missing canonical_class`);
+                            }
+                            if (!r.bucket_key) {
+                                throw new Error(`规则[${i}]: missing bucket_key`);
+                            }
+                            if ((!r.all_contains || r.all_contains.length === 0) && (!r.any_contains || r.any_contains.length === 0)) {
+                                throw new Error(`规则[${i}]: 至少需要 all_contains 或 any_contains`);
+                            }
+                        }
+                        errorEl.textContent = '';
+                        errorEl.classList.add('hidden');
+                        showToast('规则验证通过', 'success');
+                    } catch (e) {
+                        errorEl.textContent = '验证失败: ' + e.message;
+                        errorEl.classList.remove('hidden');
+                        showToast(e.message, 'error');
+                    }
+                };
                 $('#save-settings-btn').onclick = async () => {
                     try {
                         const days = parseInt($('#setting-retention').value) || 0;
                         const activeUaDays = parseInt($('#setting-active-ua-days').value) || 30;
-                        await api('/settings', { method: 'PUT', body: JSON.stringify({ log_retention_days: days, active_ua_days: activeUaDays }) });
+                        // Parse and validate UA normalization rules
+                        const uaEnabled = $('#setting-ua-enabled').checked;
+                        const uaUnknownPassthrough = $('#setting-ua-unknown-passthrough').checked;
+                        const rulesText = $('#setting-ua-rules').value.trim();
+                        let rules = [];
+                        
+                        if (rulesText) {
+                            try {
+                                rules = JSON.parse(rulesText);
+                                if (!Array.isArray(rules)) {
+                                    throw new Error('规则必须是数组');
+                                }
+                                // Validate each rule structure
+                                for (let i = 0; i < rules.length; i++) {
+                                    const r = rules[i];
+                                    if (!r.canonical_class) {
+                                        throw new Error(`规则[${i}]: missing canonical_class`);
+                                    }
+                                    if (!r.bucket_key) {
+                                        throw new Error(`规则[${i}]: missing bucket_key`);
+                                    }
+                                    if ((!r.all_contains || r.all_contains.length === 0) && (!r.any_contains || r.any_contains.length === 0)) {
+                                        throw new Error(`规则[${i}]: 至少需要 all_contains 或 any_contains`);
+                                    }
+                                }
+                            } catch (e) {
+                                throw new Error('UA规则JSON格式错误: ' + e.message);
+                            }
+                        }
+
+                        const payload = {
+                            log_retention_days: days,
+                            active_ua_days: activeUaDays,
+                            ua_normalization: {
+                                enabled: uaEnabled,
+                                unknown_passthrough: uaUnknownPassthrough,
+                                rules: rules
+                            }
+                        };
+
+                        await api('/settings', { method: 'PUT', body: JSON.stringify(payload) });
                         showToast('设置已保存', 'success');
                     } catch (e) {
                         showToast(e.message, 'error');
