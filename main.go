@@ -45,6 +45,8 @@ func main() {
 		adminAPI.GET("/cache-status", subscribeHandler.AdminCacheStatus)
 		adminAPI.GET("/settings", subscribeHandler.AdminGetSettings)
 		adminAPI.PUT("/settings", subscribeHandler.AdminUpdateSettings)
+		adminAPI.GET("/settings/ua-rules/export", subscribeHandler.AdminExportUARules)
+		adminAPI.POST("/settings/ua-rules/import", subscribeHandler.AdminImportUARules)
 		adminAPI.POST("/refresh", subscribeHandler.AdminManualRefresh)
 
 		adminAPI.GET("/upstreams", subscribeHandler.AdminListUpstreams)

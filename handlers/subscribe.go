@@ -81,6 +81,12 @@ type globalConfigRequest struct {
 	UANormalization  store.UANormalizationConfig `json:"ua_normalization"`
 }
 
+type uaRulesImportRequest struct {
+	Enabled            *bool                       `json:"enabled"`
+	UnknownPassthrough *bool                       `json:"unknown_passthrough"`
+	Rules              []store.UANormalizationRule `json:"rules"`
+}
+
 type SubscribeHandler struct {
 	config       *config.Config
 	httpClient   *utils.HTTPClient
@@ -679,6 +685,61 @@ func (h *SubscribeHandler) AdminUpdateSettings(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (h *SubscribeHandler) AdminExportUARules(c *gin.Context) {
+	config := h.state.GetGlobalConfig().UANormalization
+	fileName := fmt.Sprintf("ua-rules-%s.json", time.Now().Format("20060102-150405"))
+	payload := gin.H{
+		"enabled":             config.Enabled,
+		"unknown_passthrough": config.UnknownPassthrough,
+		"rules":               config.Rules,
+	}
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fileName))
+	c.JSON(http.StatusOK, payload)
+}
+
+func (h *SubscribeHandler) AdminImportUARules(c *gin.Context) {
+	var req uaRulesImportRequest
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
+		return
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "规则文件格式错误"})
+		return
+	}
+
+	current := h.state.GetGlobalConfig()
+	uaConfig := current.UANormalization
+	if req.Enabled != nil {
+		uaConfig.Enabled = *req.Enabled
+	}
+	if req.UnknownPassthrough != nil {
+		uaConfig.UnknownPassthrough = *req.UnknownPassthrough
+	}
+	if req.Rules == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少rules字段"})
+		return
+	}
+	uaConfig.Rules = req.Rules
+
+	if err := h.state.UpdateGlobalConfig(store.GlobalConfig{
+		LogRetentionDays: current.LogRetentionDays,
+		ActiveUADays:     current.ActiveUADays,
+		UANormalization:  uaConfig,
+	}); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":       true,
+		"imported": len(uaConfig.Rules),
+	})
 }
 
 func (h *SubscribeHandler) AdminListKeys(c *gin.Context) {

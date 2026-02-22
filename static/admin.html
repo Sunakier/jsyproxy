@@ -1354,16 +1354,35 @@
                                 <textarea class="input" id="setting-ua-rules" rows="10" style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.85rem;">${escapeHtml(rulesJson)}</textarea>
                                 <div class="form-hint">JSON格式的规则数组。每条规则需要 canonical_class, bucket_key, 以及 all_contains 或 any_contains。</div>
                                 <div id="ua-rules-error" class="text-danger text-sm mt-4 hidden"></div>
+                                <input type="file" id="ua-rules-import-file" accept="application/json,.json" class="hidden">
                             </div>
                         </div>
                         <div class="dash-card-footer">
                             <div class="dash-actions">
+                                <button class="btn btn-secondary" id="export-rules-btn">导出规则</button>
+                                <button class="btn btn-secondary" id="import-rules-btn">导入规则</button>
                                 <button class="btn btn-secondary" id="validate-rules-btn">验证规则</button>
                                 <button class="btn btn-primary" id="save-settings-btn">保存设置</button>
                             </div>
                         </div>
                     </div>
                 `;
+
+                $('#export-rules-btn').onclick = exportUARules;
+                $('#import-rules-btn').onclick = () => {
+                    const fileInput = $('#ua-rules-import-file');
+                    if (!fileInput) return;
+                    fileInput.value = '';
+                    fileInput.click();
+                };
+                const importInput = $('#ua-rules-import-file');
+                if (importInput) {
+                    importInput.onchange = async () => {
+                        const file = importInput.files && importInput.files[0];
+                        if (!file) return;
+                        await importUARulesFromFile(file);
+                    };
+                }
 
                 $('#validate-rules-btn').onclick = () => {
                     const rulesText = $('#setting-ua-rules').value.trim();
@@ -1453,6 +1472,63 @@
                 };
             } catch (e) {
                 content.innerHTML = '<div class="text-danger">加载失败: ' + escapeHtml(e.message) + '</div>';
+            }
+        }
+
+        async function exportUARules() {
+            try {
+                const res = await fetch('/admin/api/settings/ua-rules/export', {
+                    method: 'GET',
+                    credentials: 'include'
+                });
+                if (!res.ok) {
+                    if (res.status === 401) {
+                        showLogin();
+                        return;
+                    }
+                    let errorText = '导出失败';
+                    try {
+                        const errData = await res.json();
+                        errorText = errData.error || errorText;
+                    } catch (e) {}
+                    throw new Error(errorText);
+                }
+
+                const blob = await res.blob();
+                const disposition = res.headers.get('Content-Disposition') || '';
+                const match = disposition.match(/filename="?([^";]+)"?/i);
+                const filename = (match && match[1]) ? match[1] : 'ua-rules-export.json';
+
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+                showToast('规则导出成功', 'success');
+            } catch (e) {
+                showToast(e.message || '导出失败', 'error');
+            }
+        }
+
+        async function importUARulesFromFile(file) {
+            if (!file) return;
+            try {
+                const text = await file.text();
+                const payload = JSON.parse(text);
+                if (!payload || !Array.isArray(payload.rules)) {
+                    throw new Error('规则文件必须包含 rules 数组');
+                }
+                const result = await api('/settings/ua-rules/import', {
+                    method: 'POST',
+                    body: JSON.stringify(payload)
+                });
+                showToast(`规则导入成功，共 ${result.imported || 0} 条`, 'success');
+                renderSettings();
+            } catch (e) {
+                showToast(e.message || '导入失败', 'error');
             }
         }
 
