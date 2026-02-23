@@ -1694,6 +1694,9 @@
                         ? '<span class="tag tag-green"><span class="tag-dot bg-success"></span>启用</span>' 
                         : '<span class="tag tag-red"><span class="tag-dot bg-danger"></span>禁用</span>';
                     const upstreamType = (u.type || 'single') === 'merge' ? 'M类合并' : '普通';
+                    const contentModeText = (u.content_mode || 'passthrough') === 'modify' ? '修改内容' : '透传';
+                    const formatTextMap = { raw: 'RAW透传', v2ray: 'V2Ray', clash: 'Clash', clash_meta: 'Clash.Meta', mihomo: 'Mihomo', stash: 'Stash', surge: 'Surge', singbox: 'Sing-box' };
+                    const formatText = formatTextMap[String(u.subscription_format || 'raw')] || String(u.subscription_format || 'raw');
                     const isMerge = (u.type || 'single') === 'merge';
                     const mergeConfig = (u && typeof u.merge_config === 'object' && u.merge_config) ? u.merge_config : {};
                     const mergeSources = Array.isArray(mergeConfig.sources) ? mergeConfig.sources : [];
@@ -1761,6 +1764,14 @@
                                 <div class="dash-info-group">
                                     <span class="dash-label">类型</span>
                                     <span class="dash-value sm">${escapeHtml(upstreamType)}</span>
+                                </div>
+                                <div class="dash-info-group">
+                                    <span class="dash-label">内容模式</span>
+                                    <span class="dash-value sm">${escapeHtml(contentModeText)}</span>
+                                </div>
+                                <div class="dash-info-group">
+                                    <span class="dash-label">输出格式</span>
+                                    <span class="dash-value sm">${escapeHtml(formatText)}</span>
                                 </div>
                                 ${mergeDetailHtml}
                                 
@@ -1894,6 +1905,9 @@
                 rules: []
             };
             const initialMergeConfig = normalizeMergeConfigForUI(data?.merge_config || mergeDefaults);
+            const initialContentMode = String(data?.content_mode || ((data?.type || 'single') === 'merge' ? 'modify' : 'passthrough')).trim() || 'passthrough';
+            const initialSubscriptionFormat = String(data?.subscription_format || (initialContentMode === 'modify' ? 'v2ray' : 'raw')).trim() || 'raw';
+            const initialClashConfig = (data?.clash_config && typeof data.clash_config === 'object') ? data.clash_config : {};
             const html = `
                 <div class="form-group">
                     <label class="form-label">名称 *</label>
@@ -2003,6 +2017,58 @@
                         </select>
                     </div>
                 </div>
+                <div class="flex gap-2">
+                    <div class="form-group" style="flex:1">
+                        <label class="form-label">内容模式</label>
+                        <select class="input" id="up-content-mode">
+                            <option value="passthrough" ${initialContentMode === 'passthrough' ? 'selected' : ''}>透传（原样缓存）</option>
+                            <option value="modify" ${initialContentMode === 'modify' ? 'selected' : ''}>修改内容（过滤/替换/转换）</option>
+                        </select>
+                        <div class="form-hint">默认透传；启用修改内容后才可进行节点过滤、名称替换与订阅转换。</div>
+                    </div>
+                    <div class="form-group" style="flex:1">
+                        <label class="form-label">输出格式</label>
+                        <select class="input" id="up-subscription-format">
+                            <option value="raw" ${initialSubscriptionFormat === 'raw' ? 'selected' : ''}>RAW透传</option>
+                            <option value="v2ray" ${initialSubscriptionFormat === 'v2ray' ? 'selected' : ''}>V2Ray(Base64 URI)</option>
+                            <option value="clash" ${initialSubscriptionFormat === 'clash' ? 'selected' : ''}>Clash YAML</option>
+                            <option value="clash_meta" ${initialSubscriptionFormat === 'clash_meta' ? 'selected' : ''}>Clash.Meta YAML</option>
+                            <option value="mihomo" ${initialSubscriptionFormat === 'mihomo' ? 'selected' : ''}>Mihomo YAML</option>
+                            <option value="stash" ${initialSubscriptionFormat === 'stash' ? 'selected' : ''}>Stash YAML</option>
+                            <option value="surge" ${initialSubscriptionFormat === 'surge' ? 'selected' : ''}>Surge Conf</option>
+                            <option value="singbox" ${initialSubscriptionFormat === 'singbox' ? 'selected' : ''}>Sing-box JSON</option>
+                        </select>
+                    </div>
+                </div>
+                <div id="clash-config-fields" class="hidden">
+                    <div class="form-group">
+                        <label class="form-label">Clash模板模式</label>
+                        <select class="input" id="up-clash-template-mode">
+                            <option value="default" ${String(initialClashConfig.template_mode || 'default') === 'default' ? 'selected' : ''}>默认模板（内置）</option>
+                            <option value="custom" ${String(initialClashConfig.template_mode || '') === 'custom' ? 'selected' : ''}>自定义模板</option>
+                        </select>
+                        <div class="form-hint">默认模板会自动生成基础配置；若上游本身是 Clash YAML，会优先复用其配置骨架。</div>
+                    </div>
+                    <div class="form-group" id="clash-template-editor-wrap" style="display:none;">
+                        <label class="form-label">自定义Clash模板（YAML）</label>
+                        <textarea class="input" id="up-clash-template" rows="8" placeholder="mixed-port: 7890
+mode: rule
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - DIRECT
+rules:
+  - MATCH,PROXY">${escapeHtml(String(initialClashConfig.template || ''))}</textarea>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">附加Clash配置（可选，YAML）</label>
+                        <textarea class="input" id="up-clash-custom-config" rows="5" placeholder="dns:
+  enable: true
+  nameserver:
+    - https://1.1.1.1/dns-query">${escapeHtml(String(initialClashConfig.custom_config || ''))}</textarea>
+                    </div>
+                </div>
                 <div class="form-group">
                     <label><input type="checkbox" id="up-enabled" ${!data || data.enabled ? 'checked' : ''}> 启用</label>
                 </div>
@@ -2032,8 +2098,22 @@
                     custom_headers: customHeaders,
                     refresh_interval: $('#up-interval').value.trim() || '10m',
                     cache_strategy: $('#up-strategy').value,
+                    content_mode: ($('#up-content-mode')?.value || 'passthrough').trim() || 'passthrough',
+                    subscription_format: ($('#up-subscription-format')?.value || 'raw').trim() || 'raw',
+                    clash_config: {
+                        template_mode: ($('#up-clash-template-mode')?.value || 'default').trim() || 'default',
+                        template: $('#up-clash-template')?.value || '',
+                        custom_config: $('#up-clash-custom-config')?.value || ''
+                    },
                     enabled: $('#up-enabled').checked
                 };
+
+                if (payload.type === 'merge') {
+                    payload.content_mode = 'modify';
+                }
+                if (payload.content_mode === 'passthrough') {
+                    payload.subscription_format = 'raw';
+                }
 
                 if (payload.type === 'merge') {
                     payload.merge_config = collectMergeConfigFromForm();
@@ -2045,6 +2125,16 @@
                 if (payload.type === 'single' && !payload.api_endpoint) throw new Error('普通上游必须填写API端点地址');
                 if (payload.type === 'merge' && (!payload.merge_config || !Array.isArray(payload.merge_config.sources) || payload.merge_config.sources.length === 0)) {
                     throw new Error('M类上游至少需要一个来源上游');
+                }
+                if (payload.type === 'merge' && payload.content_mode !== 'modify') {
+                    throw new Error('M类上游必须开启修改内容模式');
+                }
+                if (payload.content_mode === 'passthrough' && payload.subscription_format !== 'raw') {
+                    throw new Error('订阅转换需开启修改内容模式');
+                }
+                const clashLikeFormats = new Set(['clash', 'clash_meta', 'mihomo', 'stash']);
+                if (clashLikeFormats.has(payload.subscription_format) && payload.clash_config.template_mode === 'custom' && !String(payload.clash_config.template || '').trim()) {
+                    throw new Error('自定义Clash模板不能为空');
                 }
 
                 const url = isEdit ? '/upstreams/' + data.id : '/upstreams';
@@ -2063,10 +2153,63 @@
             initMergeRulesList(initialMergeConfig.rules || []);
 
             const typeSelect = $('#up-type');
+            const modeSelect = $('#up-content-mode');
+            const formatSelect = $('#up-subscription-format');
+            const clashTemplateModeSelect = $('#up-clash-template-mode');
             if (typeSelect) {
-                typeSelect.onchange = () => toggleUpstreamTypeFields(typeSelect.value);
-                toggleUpstreamTypeFields(typeSelect.value || 'single');
+                typeSelect.onchange = () => syncUpstreamModeAndTypeUI();
             }
+            if (modeSelect) {
+                modeSelect.onchange = () => syncUpstreamModeAndTypeUI();
+            }
+            if (formatSelect) {
+                formatSelect.onchange = () => syncUpstreamModeAndTypeUI();
+            }
+            if (clashTemplateModeSelect) {
+                clashTemplateModeSelect.onchange = () => syncUpstreamModeAndTypeUI();
+            }
+            syncUpstreamModeAndTypeUI();
+        }
+
+        function syncUpstreamModeAndTypeUI() {
+            const type = String($('#up-type')?.value || 'single').trim();
+            const modeEl = $('#up-content-mode');
+            const formatEl = $('#up-subscription-format');
+            const clashWrap = $('#clash-config-fields');
+            const clashTemplateWrap = $('#clash-template-editor-wrap');
+            const clashTemplateMode = String($('#up-clash-template-mode')?.value || 'default').trim();
+
+            toggleUpstreamTypeFields(type);
+
+            if (type === 'merge' && modeEl) {
+                modeEl.value = 'modify';
+            }
+            const mode = String(modeEl?.value || 'passthrough').trim();
+            if (formatEl) {
+                if (mode === 'passthrough') {
+                    formatEl.value = 'raw';
+                } else if (formatEl.value === 'raw') {
+                    formatEl.value = 'v2ray';
+                }
+                formatEl.querySelectorAll('option').forEach(opt => {
+                    if (opt.value === 'raw') {
+                        opt.disabled = mode !== 'passthrough';
+                    }
+                });
+                formatEl.disabled = false;
+            }
+            if (modeEl) {
+                modeEl.querySelectorAll('option').forEach(opt => {
+                    if (opt.value === 'passthrough') {
+                        opt.disabled = type === 'merge';
+                    }
+                });
+            }
+
+            const format = String(formatEl?.value || 'raw').trim();
+            const showClash = mode === 'modify' && (format === 'clash' || format === 'clash_meta' || format === 'mihomo' || format === 'stash');
+            if (clashWrap) clashWrap.classList.toggle('hidden', !showClash);
+            if (clashTemplateWrap) clashTemplateWrap.style.display = (showClash && clashTemplateMode === 'custom') ? '' : 'none';
         }
 
         function normalizeMergeConfigForUI(config) {

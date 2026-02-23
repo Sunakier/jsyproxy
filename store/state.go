@@ -25,6 +25,18 @@ const (
 	CacheStrategyLazy           = "lazy"
 	UpstreamTypeSingle          = "single"
 	UpstreamTypeMerge           = "merge"
+	ContentModePassthrough      = "passthrough"
+	ContentModeModify           = "modify"
+	SubscriptionFormatRaw       = "raw"
+	SubscriptionFormatV2Ray     = "v2ray"
+	SubscriptionFormatClash     = "clash"
+	SubscriptionFormatClashMeta = "clash_meta"
+	SubscriptionFormatMihomo    = "mihomo"
+	SubscriptionFormatStash     = "stash"
+	SubscriptionFormatSurge     = "surge"
+	SubscriptionFormatSingBox   = "singbox"
+	ClashTemplateModeDefault    = "default"
+	ClashTemplateModeCustom     = "custom"
 	cacheVariantDefault         = "__default__"
 	cacheVariantUnknown         = "__unknown__"
 	maxTrackedUAVariants        = 100
@@ -50,6 +62,9 @@ type Upstream struct {
 	ID                        string            `json:"id"`
 	Name                      string            `json:"name"`
 	Type                      string            `json:"type,omitempty"`
+	ContentMode               string            `json:"content_mode,omitempty"`
+	SubscriptionFormat        string            `json:"subscription_format,omitempty"`
+	ClashConfig               ClashConfig       `json:"clash_config,omitempty"`
 	MergeConfig               MergeConfig       `json:"merge_config,omitempty"`
 	APIEndpoint               string            `json:"api_endpoint"`
 	NodeStatusAPIEndpoint     string            `json:"node_status_api_endpoint,omitempty"`
@@ -64,6 +79,12 @@ type Upstream struct {
 	CacheStrategy             string            `json:"cache_strategy"`
 	Enabled                   bool              `json:"enabled"`
 	CreatedAt                 time.Time         `json:"created_at"`
+}
+
+type ClashConfig struct {
+	TemplateMode string `json:"template_mode,omitempty"`
+	Template     string `json:"template,omitempty"`
+	CustomConfig string `json:"custom_config,omitempty"`
 }
 
 type MergeConfig struct {
@@ -247,8 +268,13 @@ func New(dataFile string, initialKeys []string, defaultRefreshInterval, adminUse
 
 	if len(s.upstreams) == 0 {
 		defaultUpstream := Upstream{
-			ID:               uuid.New().String(),
-			Name:             "default",
+			ID:                 uuid.New().String(),
+			Name:               "default",
+			ContentMode:        ContentModePassthrough,
+			SubscriptionFormat: SubscriptionFormatRaw,
+			ClashConfig: ClashConfig{
+				TemplateMode: ClashTemplateModeDefault,
+			},
 			RequestUserAgent: defaultUserAgent,
 			RefreshInterval:  normalizeInterval(defaultRefreshInterval),
 			CacheStrategy:    CacheStrategyForce,
@@ -1779,6 +1805,16 @@ func (s *State) AddUpstream(u Upstream) error {
 		u.RequestUserAgent = defaultUserAgent
 	}
 	u.Type = normalizeUpstreamType(u.Type)
+	u.ContentMode = normalizeContentMode(u.ContentMode)
+	u.SubscriptionFormat = normalizeSubscriptionFormat(u.SubscriptionFormat, u.ContentMode)
+	if u.Type == UpstreamTypeMerge {
+		u.ContentMode = ContentModeModify
+		u.SubscriptionFormat = normalizeSubscriptionFormat(u.SubscriptionFormat, u.ContentMode)
+		if u.SubscriptionFormat == SubscriptionFormatRaw {
+			u.SubscriptionFormat = SubscriptionFormatV2Ray
+		}
+	}
+	u.ClashConfig = normalizeClashConfig(u.ClashConfig)
 	u.MergeConfig = normalizeMergeConfig(u.MergeConfig)
 	u.RefreshInterval = normalizeInterval(u.RefreshInterval)
 	u.NodeStatusRefreshInterval = normalizeInterval(u.NodeStatusRefreshInterval)
@@ -1807,6 +1843,16 @@ func (s *State) UpdateUpstream(u Upstream) error {
 		u.RequestUserAgent = defaultUserAgent
 	}
 	u.Type = normalizeUpstreamType(u.Type)
+	u.ContentMode = normalizeContentMode(u.ContentMode)
+	u.SubscriptionFormat = normalizeSubscriptionFormat(u.SubscriptionFormat, u.ContentMode)
+	if u.Type == UpstreamTypeMerge {
+		u.ContentMode = ContentModeModify
+		u.SubscriptionFormat = normalizeSubscriptionFormat(u.SubscriptionFormat, u.ContentMode)
+		if u.SubscriptionFormat == SubscriptionFormatRaw {
+			u.SubscriptionFormat = SubscriptionFormatV2Ray
+		}
+	}
+	u.ClashConfig = normalizeClashConfig(u.ClashConfig)
 	u.MergeConfig = normalizeMergeConfig(u.MergeConfig)
 	u.RefreshInterval = normalizeInterval(u.RefreshInterval)
 	u.NodeStatusRefreshInterval = normalizeInterval(u.NodeStatusRefreshInterval)
@@ -1913,6 +1959,16 @@ func (s *State) load() error {
 
 	for _, u := range persisted.Upstreams {
 		u.Type = normalizeUpstreamType(u.Type)
+		u.ContentMode = normalizeContentMode(u.ContentMode)
+		u.SubscriptionFormat = normalizeSubscriptionFormat(u.SubscriptionFormat, u.ContentMode)
+		if u.Type == UpstreamTypeMerge {
+			u.ContentMode = ContentModeModify
+			u.SubscriptionFormat = normalizeSubscriptionFormat(u.SubscriptionFormat, u.ContentMode)
+			if u.SubscriptionFormat == SubscriptionFormatRaw {
+				u.SubscriptionFormat = SubscriptionFormatV2Ray
+			}
+		}
+		u.ClashConfig = normalizeClashConfig(u.ClashConfig)
 		u.MergeConfig = normalizeMergeConfig(u.MergeConfig)
 		s.upstreams[u.ID] = u
 	}
@@ -2084,6 +2140,56 @@ func normalizeUpstreamType(raw string) string {
 	return UpstreamTypeSingle
 }
 
+func normalizeContentMode(raw string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	if trimmed == ContentModeModify {
+		return ContentModeModify
+	}
+	return ContentModePassthrough
+}
+
+func normalizeSubscriptionFormat(raw string, mode string) string {
+	normalizedMode := normalizeContentMode(mode)
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	if normalizedMode == ContentModePassthrough {
+		return SubscriptionFormatRaw
+	}
+	switch trimmed {
+	case SubscriptionFormatClash:
+		return SubscriptionFormatClash
+	case "clashmeta", "clash-meta", "clash.meta", SubscriptionFormatClashMeta:
+		return SubscriptionFormatClashMeta
+	case "meta", SubscriptionFormatMihomo:
+		return SubscriptionFormatMihomo
+	case SubscriptionFormatStash:
+		return SubscriptionFormatStash
+	case SubscriptionFormatSurge:
+		return SubscriptionFormatSurge
+	case SubscriptionFormatSingBox:
+		return SubscriptionFormatSingBox
+	case SubscriptionFormatV2Ray:
+		return SubscriptionFormatV2Ray
+	default:
+		return SubscriptionFormatV2Ray
+	}
+}
+
+func normalizeClashTemplateMode(raw string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	if trimmed == ClashTemplateModeCustom {
+		return ClashTemplateModeCustom
+	}
+	return ClashTemplateModeDefault
+}
+
+func normalizeClashConfig(cfg ClashConfig) ClashConfig {
+	return ClashConfig{
+		TemplateMode: normalizeClashTemplateMode(cfg.TemplateMode),
+		Template:     strings.TrimSpace(cfg.Template),
+		CustomConfig: strings.TrimSpace(cfg.CustomConfig),
+	}
+}
+
 func normalizeMergeConfig(cfg MergeConfig) MergeConfig {
 	normalized := MergeConfig{
 		Sources:             make([]MergeSource, 0, len(cfg.Sources)),
@@ -2164,7 +2270,35 @@ func (s *State) validateUpstreamLocked(u Upstream) error {
 	if strings.TrimSpace(u.Name) == "" {
 		return errors.New("上游名称不能为空")
 	}
+	if u.ContentMode != ContentModePassthrough && u.ContentMode != ContentModeModify {
+		return errors.New("不支持的内容模式")
+	}
+	if u.ContentMode == ContentModePassthrough {
+		if u.SubscriptionFormat != SubscriptionFormatRaw {
+			return errors.New("订阅转换需开启修改内容模式")
+		}
+	} else {
+		if u.SubscriptionFormat != SubscriptionFormatV2Ray && u.SubscriptionFormat != SubscriptionFormatClash && u.SubscriptionFormat != SubscriptionFormatClashMeta && u.SubscriptionFormat != SubscriptionFormatMihomo && u.SubscriptionFormat != SubscriptionFormatStash && u.SubscriptionFormat != SubscriptionFormatSurge && u.SubscriptionFormat != SubscriptionFormatSingBox {
+			return errors.New("不支持的订阅输出格式")
+		}
+	}
+	if u.SubscriptionFormat == SubscriptionFormatClash || u.SubscriptionFormat == SubscriptionFormatClashMeta || u.SubscriptionFormat == SubscriptionFormatMihomo || u.SubscriptionFormat == SubscriptionFormatStash {
+		if u.ClashConfig.TemplateMode == ClashTemplateModeCustom && strings.TrimSpace(u.ClashConfig.Template) == "" {
+			return errors.New("自定义Clash模板不能为空")
+		}
+	}
+	for _, rule := range u.MergeConfig.Rules {
+		if !isSupportedMergeRuleField(rule.Field) {
+			return fmt.Errorf("不支持的过滤字段: %s", rule.Field)
+		}
+		if !isSupportedMergeRuleOp(rule.Op) {
+			return fmt.Errorf("不支持的过滤操作: %s", rule.Op)
+		}
+	}
 	if u.Type == UpstreamTypeMerge {
+		if u.ContentMode != ContentModeModify {
+			return errors.New("M类上游必须开启修改内容模式")
+		}
 		if len(u.MergeConfig.Sources) == 0 {
 			return errors.New("M类上游至少需要一个来源上游")
 		}
@@ -2174,14 +2308,6 @@ func (s *State) validateUpstreamLocked(u Upstream) error {
 			}
 			if _, ok := s.upstreams[source.UpstreamID]; !ok {
 				return fmt.Errorf("来源上游不存在: %s", source.UpstreamID)
-			}
-		}
-		for _, rule := range u.MergeConfig.Rules {
-			if !isSupportedMergeRuleField(rule.Field) {
-				return fmt.Errorf("不支持的过滤字段: %s", rule.Field)
-			}
-			if !isSupportedMergeRuleOp(rule.Op) {
-				return fmt.Errorf("不支持的过滤操作: %s", rule.Op)
 			}
 		}
 		return nil

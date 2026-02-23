@@ -25,7 +25,10 @@ import (
 
 var passthroughHeaderWhitelist = map[string]struct{}{
 	"subscription-userinfo":     {},
+	"x-sub-info":                {},
+	"profile-title":             {},
 	"profile-web-page-url":      {},
+	"support-url":               {},
 	"profile-update-interval":   {},
 	"content-disposition":       {},
 	"content-type":              {},
@@ -89,6 +92,9 @@ type upstreamRequest struct {
 	ID                        string            `json:"id"`
 	Name                      string            `json:"name"`
 	Type                      string            `json:"type"`
+	ContentMode               string            `json:"content_mode"`
+	SubscriptionFormat        string            `json:"subscription_format"`
+	ClashConfig               store.ClashConfig `json:"clash_config"`
 	MergeConfig               store.MergeConfig `json:"merge_config"`
 	APIEndpoint               string            `json:"api_endpoint"`
 	NodeStatusAPIEndpoint     string            `json:"node_status_api_endpoint"`
@@ -346,10 +352,59 @@ func (h *SubscribeHandler) refreshSingleUpstreamCache(upstream store.Upstream, r
 	if err != nil {
 		return err
 	}
+	body := fetched.Body
+	headers := fetched.Headers
+	if upstream.ContentMode == store.ContentModeModify {
+		headers = filterAllowedPassthroughHeaders(fetched.Headers)
+		ensureTrafficMetadataHeaders(headers, fetched.TrafficStatus)
+		nodes, err := ParseSubscriptionNodes(fetched.Body)
+		if err != nil {
+			return fmt.Errorf("解析订阅内容失败: %w", err)
+		}
+		nodes = ApplyNameReplacements(nodes, upstream.MergeConfig.NameReplacements)
+		nodes = FilterNodes(nodes, upstream.MergeConfig.IncludeNameContains, upstream.MergeConfig.ExcludeNameContains, upstream.MergeConfig.Rules)
+		if len(nodes) == 0 {
+			return errors.New("修改内容后没有可用节点")
+		}
+		switch upstream.SubscriptionFormat {
+		case store.SubscriptionFormatClash, store.SubscriptionFormatClashMeta, store.SubscriptionFormatMihomo, store.SubscriptionFormatStash:
+			rendered, err := RenderClashSubscription(nodes, fetched.Body, upstream.ClashConfig)
+			if err != nil {
+				return err
+			}
+			body = rendered
+			setHeaderValues(headers, "Content-Type", []string{"text/yaml; charset=utf-8"})
+			deleteHeader(headers, "Content-Transfer-Encoding")
+		case store.SubscriptionFormatSurge:
+			rendered, err := RenderSurgeSubscription(nodes)
+			if err != nil {
+				return err
+			}
+			body = rendered
+			setHeaderValues(headers, "Content-Type", []string{"text/plain; charset=utf-8"})
+			deleteHeader(headers, "Content-Transfer-Encoding")
+		case store.SubscriptionFormatSingBox:
+			rendered, err := RenderSingBoxSubscription(nodes, fetched.Body)
+			if err != nil {
+				return err
+			}
+			body = rendered
+			setHeaderValues(headers, "Content-Type", []string{"application/json; charset=utf-8"})
+			deleteHeader(headers, "Content-Transfer-Encoding")
+		default:
+			rendered, err := RenderStandardV2RaySubscription(nodes)
+			if err != nil {
+				return err
+			}
+			body = rendered
+			setHeaderValues(headers, "Content-Type", []string{"text/plain; charset=utf-8"})
+			setHeaderValues(headers, "Content-Transfer-Encoding", []string{"base64"})
+		}
+	}
 	cacheVariantUA := strings.TrimSpace(downstreamUA)
 	h.state.SetCache(upstream.ID, cacheVariantUA, &store.CachedSubscription{
-		Body:          fetched.Body,
-		Headers:       fetched.Headers,
+		Body:          body,
+		Headers:       headers,
 		StatusCode:    fetched.StatusCode,
 		UpdatedAt:     time.Now(),
 		SourceURL:     fetched.SourceURL,
@@ -361,6 +416,8 @@ func (h *SubscribeHandler) refreshSingleUpstreamCache(upstream store.Upstream, r
 
 func (h *SubscribeHandler) refreshMergeUpstreamCache(upstream store.Upstream, reason, downstreamUA string) error {
 	nodes := make([]MergedNode, 0)
+	passthroughHeaders := make(map[string][]string)
+	mergedTraffic := store.TrafficStatus{}
 	for _, source := range upstream.MergeConfig.Sources {
 		if source.Enabled != nil && !*source.Enabled {
 			continue
@@ -380,6 +437,8 @@ func (h *SubscribeHandler) refreshMergeUpstreamCache(upstream store.Upstream, re
 			log.Printf("M类上游来源拉取失败 merge=%s source=%s: %v", upstream.ID, source.UpstreamID, err)
 			continue
 		}
+		mergeAllowedPassthroughHeadersFromMap(passthroughHeaders, fetched.Headers)
+		mergeTrafficStatus(&mergedTraffic, fetched.TrafficStatus)
 		parsed, err := ParseSubscriptionNodes(fetched.Body)
 		if err != nil {
 			log.Printf("M类上游来源解析失败 merge=%s source=%s: %v", upstream.ID, source.UpstreamID, err)
@@ -399,20 +458,46 @@ func (h *SubscribeHandler) refreshMergeUpstreamCache(upstream store.Upstream, re
 		return errors.New("M类上游合并后没有可用节点")
 	}
 
-	body, err := RenderStandardV2RaySubscription(nodes)
-	if err != nil {
-		return err
-	}
-	headers := map[string][]string{
-		"Content-Type":              {"text/plain; charset=utf-8"},
-		"Content-Transfer-Encoding": {"base64"},
+	var body []byte
+	var err error
+	headers := filterAllowedPassthroughHeaders(passthroughHeaders)
+	ensureTrafficMetadataHeaders(headers, mergedTraffic)
+	if upstream.SubscriptionFormat == store.SubscriptionFormatClash || upstream.SubscriptionFormat == store.SubscriptionFormatClashMeta || upstream.SubscriptionFormat == store.SubscriptionFormatMihomo || upstream.SubscriptionFormat == store.SubscriptionFormatStash {
+		body, err = RenderClashSubscription(nodes, nil, upstream.ClashConfig)
+		if err != nil {
+			return err
+		}
+		setHeaderValues(headers, "Content-Type", []string{"text/yaml; charset=utf-8"})
+		deleteHeader(headers, "Content-Transfer-Encoding")
+	} else if upstream.SubscriptionFormat == store.SubscriptionFormatSurge {
+		body, err = RenderSurgeSubscription(nodes)
+		if err != nil {
+			return err
+		}
+		setHeaderValues(headers, "Content-Type", []string{"text/plain; charset=utf-8"})
+		deleteHeader(headers, "Content-Transfer-Encoding")
+	} else if upstream.SubscriptionFormat == store.SubscriptionFormatSingBox {
+		body, err = RenderSingBoxSubscription(nodes, nil)
+		if err != nil {
+			return err
+		}
+		setHeaderValues(headers, "Content-Type", []string{"application/json; charset=utf-8"})
+		deleteHeader(headers, "Content-Transfer-Encoding")
+	} else {
+		body, err = RenderStandardV2RaySubscription(nodes)
+		if err != nil {
+			return err
+		}
+		setHeaderValues(headers, "Content-Type", []string{"text/plain; charset=utf-8"})
+		setHeaderValues(headers, "Content-Transfer-Encoding", []string{"base64"})
 	}
 	h.state.SetCache(upstream.ID, downstreamUA, &store.CachedSubscription{
-		Body:       body,
-		Headers:    headers,
-		StatusCode: http.StatusOK,
-		UpdatedAt:  time.Now(),
-		SourceURL:  "merge://" + upstream.ID,
+		Body:          body,
+		Headers:       headers,
+		StatusCode:    http.StatusOK,
+		UpdatedAt:     time.Now(),
+		SourceURL:     "merge://" + upstream.ID,
+		TrafficStatus: mergedTraffic,
 	})
 	log.Printf("M类订阅缓存刷新成功 upstream=%s reason=%s nodes=%d bytes=%d", upstream.ID, reason, len(nodes), len(body))
 	return nil
@@ -477,19 +562,21 @@ func (h *SubscribeHandler) fetchSingleUpstreamContent(upstream store.Upstream, d
 		headersCopy[k] = append([]string(nil), values...)
 	}
 	mergeAllowedPassthroughHeaders(headersCopy, resp.Header)
+	trafficStatus := store.TrafficStatus{
+		ExpiredAt:      subscribeResp.Data.ExpiredAt,
+		UsedUpload:     subscribeResp.Data.U,
+		UsedDownload:   subscribeResp.Data.D,
+		TransferEnable: subscribeResp.Data.TransferEnable,
+		PlanName:       subscribeResp.Data.Plan.Name,
+		ResetDay:       subscribeResp.Data.ResetDay,
+	}
+	ensureTrafficMetadataHeaders(headersCopy, trafficStatus)
 	return &fetchedSubscription{
-		Body:       body,
-		Headers:    headersCopy,
-		StatusCode: contentResp.StatusCode,
-		SourceURL:  subscribeResp.Data.SubscribeURL,
-		TrafficStatus: store.TrafficStatus{
-			ExpiredAt:      subscribeResp.Data.ExpiredAt,
-			UsedUpload:     subscribeResp.Data.U,
-			UsedDownload:   subscribeResp.Data.D,
-			TransferEnable: subscribeResp.Data.TransferEnable,
-			PlanName:       subscribeResp.Data.Plan.Name,
-			ResetDay:       subscribeResp.Data.ResetDay,
-		},
+		Body:          body,
+		Headers:       headersCopy,
+		StatusCode:    contentResp.StatusCode,
+		SourceURL:     subscribeResp.Data.SubscribeURL,
+		TrafficStatus: trafficStatus,
 	}, nil
 }
 
@@ -599,6 +686,9 @@ func (h *SubscribeHandler) AdminStatus(c *gin.Context) {
 			"id":                           u.ID,
 			"name":                         u.Name,
 			"type":                         u.Type,
+			"content_mode":                 u.ContentMode,
+			"subscription_format":          u.SubscriptionFormat,
+			"clash_config":                 u.ClashConfig,
 			"merge_config":                 u.MergeConfig,
 			"enabled":                      u.Enabled,
 			"cache_strategy":               u.CacheStrategy,
@@ -754,6 +844,9 @@ func (h *SubscribeHandler) AdminAddUpstream(c *gin.Context) {
 	upstream := store.Upstream{
 		Name:                      strings.TrimSpace(req.Name),
 		Type:                      strings.TrimSpace(req.Type),
+		ContentMode:               strings.TrimSpace(req.ContentMode),
+		SubscriptionFormat:        strings.TrimSpace(req.SubscriptionFormat),
+		ClashConfig:               req.ClashConfig,
 		MergeConfig:               req.MergeConfig,
 		APIEndpoint:               strings.TrimSpace(req.APIEndpoint),
 		NodeStatusAPIEndpoint:     strings.TrimSpace(req.NodeStatusAPIEndpoint),
@@ -803,6 +896,9 @@ func (h *SubscribeHandler) AdminUpdateUpstream(c *gin.Context) {
 
 	existing.Name = strings.TrimSpace(req.Name)
 	existing.Type = strings.TrimSpace(req.Type)
+	existing.ContentMode = strings.TrimSpace(req.ContentMode)
+	existing.SubscriptionFormat = strings.TrimSpace(req.SubscriptionFormat)
+	existing.ClashConfig = req.ClashConfig
 	existing.MergeConfig = req.MergeConfig
 	existing.APIEndpoint = strings.TrimSpace(req.APIEndpoint)
 	existing.NodeStatusAPIEndpoint = strings.TrimSpace(req.NodeStatusAPIEndpoint)
@@ -1445,6 +1541,116 @@ func copyHeaders(src map[string][]string, dst http.Header) {
 		for _, value := range values {
 			dst.Add(key, value)
 		}
+	}
+}
+
+func filterAllowedPassthroughHeaders(src map[string][]string) map[string][]string {
+	dst := make(map[string][]string)
+	for key, values := range src {
+		if _, ok := passthroughHeaderWhitelist[strings.ToLower(strings.TrimSpace(key))]; !ok {
+			continue
+		}
+		if len(values) == 0 {
+			continue
+		}
+		dst[key] = append([]string(nil), values...)
+	}
+	return dst
+}
+
+func mergeAllowedPassthroughHeadersFromMap(dst map[string][]string, src map[string][]string) {
+	if len(src) == 0 {
+		return
+	}
+	for key, values := range src {
+		if _, ok := passthroughHeaderWhitelist[strings.ToLower(strings.TrimSpace(key))]; !ok {
+			continue
+		}
+		if len(values) == 0 {
+			continue
+		}
+		if _, exists := getHeaderValues(dst, key); exists {
+			continue
+		}
+		dst[key] = append([]string(nil), values...)
+	}
+}
+
+func setHeaderValues(dst map[string][]string, key string, values []string) {
+	if dst == nil {
+		return
+	}
+	for existingKey := range dst {
+		if strings.EqualFold(strings.TrimSpace(existingKey), key) {
+			dst[existingKey] = append([]string(nil), values...)
+			return
+		}
+	}
+	dst[key] = append([]string(nil), values...)
+}
+
+func deleteHeader(dst map[string][]string, key string) {
+	if dst == nil {
+		return
+	}
+	for existingKey := range dst {
+		if strings.EqualFold(strings.TrimSpace(existingKey), key) {
+			delete(dst, existingKey)
+		}
+	}
+}
+
+func getHeaderValues(src map[string][]string, key string) ([]string, bool) {
+	for existingKey, values := range src {
+		if strings.EqualFold(strings.TrimSpace(existingKey), key) {
+			return values, true
+		}
+	}
+	return nil, false
+}
+
+func ensureTrafficMetadataHeaders(headers map[string][]string, traffic store.TrafficStatus) {
+	if headers == nil {
+		return
+	}
+	if _, ok := getHeaderValues(headers, "subscription-userinfo"); !ok {
+		if value := buildSubscriptionUserInfoValue(traffic); value != "" {
+			setHeaderValues(headers, "subscription-userinfo", []string{value})
+		}
+	}
+}
+
+func buildSubscriptionUserInfoValue(traffic store.TrafficStatus) string {
+	hasTraffic := traffic.TransferEnable > 0 || traffic.UsedUpload > 0 || traffic.UsedDownload > 0 || traffic.ExpiredAt > 0
+	if !hasTraffic {
+		return ""
+	}
+	parts := []string{
+		fmt.Sprintf("upload=%d", traffic.UsedUpload),
+		fmt.Sprintf("download=%d", traffic.UsedDownload),
+		fmt.Sprintf("total=%d", traffic.TransferEnable),
+	}
+	if traffic.ExpiredAt > 0 {
+		parts = append(parts, fmt.Sprintf("expire=%d", traffic.ExpiredAt))
+	}
+	return strings.Join(parts, "; ")
+}
+
+func mergeTrafficStatus(target *store.TrafficStatus, incoming store.TrafficStatus) {
+	if target == nil {
+		return
+	}
+	target.UsedUpload += incoming.UsedUpload
+	target.UsedDownload += incoming.UsedDownload
+	target.TransferEnable += incoming.TransferEnable
+	if target.PlanName == "" && strings.TrimSpace(incoming.PlanName) != "" {
+		target.PlanName = incoming.PlanName
+	}
+	if incoming.ExpiredAt > 0 && (target.ExpiredAt <= 0 || incoming.ExpiredAt < target.ExpiredAt) {
+		target.ExpiredAt = incoming.ExpiredAt
+	}
+	if incoming.ResetDay > 0 && (target.ResetDay <= 0 || incoming.ResetDay < target.ResetDay) {
+		target.ResetDay = incoming.ResetDay
 	}
 }
 
