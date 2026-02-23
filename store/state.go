@@ -23,6 +23,8 @@ const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 const (
 	CacheStrategyForce          = "force"
 	CacheStrategyLazy           = "lazy"
+	UpstreamTypeSingle          = "single"
+	UpstreamTypeMerge           = "merge"
 	cacheVariantDefault         = "__default__"
 	cacheVariantUnknown         = "__unknown__"
 	maxTrackedUAVariants        = 100
@@ -47,6 +49,8 @@ const (
 type Upstream struct {
 	ID                        string            `json:"id"`
 	Name                      string            `json:"name"`
+	Type                      string            `json:"type,omitempty"`
+	MergeConfig               MergeConfig       `json:"merge_config,omitempty"`
 	APIEndpoint               string            `json:"api_endpoint"`
 	NodeStatusAPIEndpoint     string            `json:"node_status_api_endpoint,omitempty"`
 	NodeStatusRefreshInterval string            `json:"node_status_refresh_interval,omitempty"`
@@ -60,6 +64,31 @@ type Upstream struct {
 	CacheStrategy             string            `json:"cache_strategy"`
 	Enabled                   bool              `json:"enabled"`
 	CreatedAt                 time.Time         `json:"created_at"`
+}
+
+type MergeConfig struct {
+	Sources             []MergeSource          `json:"sources,omitempty"`
+	IncludeNameContains []string               `json:"include_name_contains,omitempty"`
+	ExcludeNameContains []string               `json:"exclude_name_contains,omitempty"`
+	NameReplacements    []MergeNameReplacement `json:"name_replacements,omitempty"`
+	Rules               []MergeRule            `json:"rules,omitempty"`
+}
+
+type MergeSource struct {
+	UpstreamID string `json:"upstream_id"`
+	Prefix     string `json:"prefix,omitempty"`
+	Enabled    *bool  `json:"enabled,omitempty"`
+}
+
+type MergeNameReplacement struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+type MergeRule struct {
+	Field string `json:"field"`
+	Op    string `json:"op"`
+	Value string `json:"value"`
 }
 
 type AccessKey struct {
@@ -1749,10 +1778,15 @@ func (s *State) AddUpstream(u Upstream) error {
 	if u.RequestUserAgent == "" {
 		u.RequestUserAgent = defaultUserAgent
 	}
+	u.Type = normalizeUpstreamType(u.Type)
+	u.MergeConfig = normalizeMergeConfig(u.MergeConfig)
 	u.RefreshInterval = normalizeInterval(u.RefreshInterval)
 	u.NodeStatusRefreshInterval = normalizeInterval(u.NodeStatusRefreshInterval)
 	u.CreatedAt = time.Now()
 	u.Enabled = true
+	if err := s.validateUpstreamLocked(u); err != nil {
+		return err
+	}
 	s.upstreams[u.ID] = u
 	return s.saveLocked()
 }
@@ -1772,8 +1806,13 @@ func (s *State) UpdateUpstream(u Upstream) error {
 	if u.RequestUserAgent == "" {
 		u.RequestUserAgent = defaultUserAgent
 	}
+	u.Type = normalizeUpstreamType(u.Type)
+	u.MergeConfig = normalizeMergeConfig(u.MergeConfig)
 	u.RefreshInterval = normalizeInterval(u.RefreshInterval)
 	u.NodeStatusRefreshInterval = normalizeInterval(u.NodeStatusRefreshInterval)
+	if err := s.validateUpstreamLocked(u); err != nil {
+		return err
+	}
 	s.upstreams[u.ID] = u
 	return s.saveLocked()
 }
@@ -1873,6 +1912,8 @@ func (s *State) load() error {
 	defer s.mu.Unlock()
 
 	for _, u := range persisted.Upstreams {
+		u.Type = normalizeUpstreamType(u.Type)
+		u.MergeConfig = normalizeMergeConfig(u.MergeConfig)
 		s.upstreams[u.ID] = u
 	}
 
@@ -2033,4 +2074,140 @@ func onlyDigits(raw string) bool {
 		}
 	}
 	return true
+}
+
+func normalizeUpstreamType(raw string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	if trimmed == UpstreamTypeMerge {
+		return UpstreamTypeMerge
+	}
+	return UpstreamTypeSingle
+}
+
+func normalizeMergeConfig(cfg MergeConfig) MergeConfig {
+	normalized := MergeConfig{
+		Sources:             make([]MergeSource, 0, len(cfg.Sources)),
+		IncludeNameContains: make([]string, 0, len(cfg.IncludeNameContains)),
+		ExcludeNameContains: make([]string, 0, len(cfg.ExcludeNameContains)),
+		NameReplacements:    make([]MergeNameReplacement, 0, len(cfg.NameReplacements)),
+		Rules:               make([]MergeRule, 0, len(cfg.Rules)),
+	}
+	seenSource := make(map[string]struct{})
+	for _, source := range cfg.Sources {
+		upstreamID := strings.TrimSpace(source.UpstreamID)
+		if upstreamID == "" {
+			continue
+		}
+		if _, ok := seenSource[upstreamID]; ok {
+			continue
+		}
+		seenSource[upstreamID] = struct{}{}
+		enabled := true
+		if source.Enabled != nil {
+			enabled = *source.Enabled
+		}
+		normalized.Sources = append(normalized.Sources, MergeSource{
+			UpstreamID: upstreamID,
+			Prefix:     strings.TrimSpace(source.Prefix),
+			Enabled:    boolPtr(enabled),
+		})
+	}
+	for _, item := range cfg.IncludeNameContains {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			continue
+		}
+		normalized.IncludeNameContains = append(normalized.IncludeNameContains, trimmed)
+	}
+	for _, item := range cfg.ExcludeNameContains {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			continue
+		}
+		normalized.ExcludeNameContains = append(normalized.ExcludeNameContains, trimmed)
+	}
+	for _, item := range cfg.NameReplacements {
+		from := strings.TrimSpace(item.From)
+		if from == "" {
+			continue
+		}
+		normalized.NameReplacements = append(normalized.NameReplacements, MergeNameReplacement{From: from, To: strings.TrimSpace(item.To)})
+	}
+	for _, rule := range cfg.Rules {
+		field := strings.ToLower(strings.TrimSpace(rule.Field))
+		op := strings.ToLower(strings.TrimSpace(rule.Op))
+		value := strings.TrimSpace(rule.Value)
+		if field == "" || op == "" || value == "" {
+			continue
+		}
+		normalized.Rules = append(normalized.Rules, MergeRule{Field: field, Op: op, Value: value})
+	}
+	if len(normalized.Sources) == 0 {
+		normalized.Sources = nil
+	}
+	if len(normalized.IncludeNameContains) == 0 {
+		normalized.IncludeNameContains = nil
+	}
+	if len(normalized.ExcludeNameContains) == 0 {
+		normalized.ExcludeNameContains = nil
+	}
+	if len(normalized.NameReplacements) == 0 {
+		normalized.NameReplacements = nil
+	}
+	if len(normalized.Rules) == 0 {
+		normalized.Rules = nil
+	}
+	return normalized
+}
+
+func (s *State) validateUpstreamLocked(u Upstream) error {
+	if strings.TrimSpace(u.Name) == "" {
+		return errors.New("上游名称不能为空")
+	}
+	if u.Type == UpstreamTypeMerge {
+		if len(u.MergeConfig.Sources) == 0 {
+			return errors.New("M类上游至少需要一个来源上游")
+		}
+		for _, source := range u.MergeConfig.Sources {
+			if source.UpstreamID == u.ID {
+				return errors.New("M类上游不能引用自身")
+			}
+			if _, ok := s.upstreams[source.UpstreamID]; !ok {
+				return fmt.Errorf("来源上游不存在: %s", source.UpstreamID)
+			}
+		}
+		for _, rule := range u.MergeConfig.Rules {
+			if !isSupportedMergeRuleField(rule.Field) {
+				return fmt.Errorf("不支持的过滤字段: %s", rule.Field)
+			}
+			if !isSupportedMergeRuleOp(rule.Op) {
+				return fmt.Errorf("不支持的过滤操作: %s", rule.Op)
+			}
+		}
+		return nil
+	}
+	return nil
+}
+
+func isSupportedMergeRuleField(field string) bool {
+	switch strings.ToLower(strings.TrimSpace(field)) {
+	case "name", "protocol", "host", "port":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSupportedMergeRuleOp(op string) bool {
+	switch strings.ToLower(strings.TrimSpace(op)) {
+	case "contains", "not_contains", "eq", "ne", "prefix", "suffix", "gt", "lt", "ge", "le":
+		return true
+	default:
+		return false
+	}
+}
+
+func boolPtr(v bool) *bool {
+	value := v
+	return &value
 }

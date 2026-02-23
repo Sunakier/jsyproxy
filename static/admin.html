@@ -1693,6 +1693,52 @@
                     const badge = u.enabled 
                         ? '<span class="tag tag-green"><span class="tag-dot bg-success"></span>启用</span>' 
                         : '<span class="tag tag-red"><span class="tag-dot bg-danger"></span>禁用</span>';
+                    const upstreamType = (u.type || 'single') === 'merge' ? 'M类合并' : '普通';
+                    const isMerge = (u.type || 'single') === 'merge';
+                    const mergeConfig = (u && typeof u.merge_config === 'object' && u.merge_config) ? u.merge_config : {};
+                    const mergeSources = Array.isArray(mergeConfig.sources) ? mergeConfig.sources : [];
+                    const mergeInclude = Array.isArray(mergeConfig.include_name_contains) ? mergeConfig.include_name_contains : [];
+                    const mergeExclude = Array.isArray(mergeConfig.exclude_name_contains) ? mergeConfig.exclude_name_contains : [];
+                    const mergeReplacements = Array.isArray(mergeConfig.name_replacements) ? mergeConfig.name_replacements : [];
+                    const mergeRules = Array.isArray(mergeConfig.rules) ? mergeConfig.rules : [];
+                    const activeSourceCount = mergeSources.filter(s => s && s.enabled !== false).length;
+                    const mergeDetailHtml = isMerge
+                        ? `
+                            <div class="dash-info-group">
+                                <span class="dash-label">来源上游</span>
+                                <span class="dash-value sm">${activeSourceCount} / ${mergeSources.length}</span>
+                            </div>
+                            <div class="dash-info-group">
+                                <span class="dash-label">名称过滤</span>
+                                <span class="dash-value sm">包含 ${mergeInclude.length} / 排除 ${mergeExclude.length}</span>
+                            </div>
+                            <div class="dash-info-group">
+                                <span class="dash-label">名称替换</span>
+                                <span class="dash-value sm">${mergeReplacements.length} 条</span>
+                            </div>
+                            <div class="dash-info-group">
+                                <span class="dash-label">扩展规则</span>
+                                <span class="dash-value sm">${mergeRules.length} 条</span>
+                            </div>
+                          `
+                        : `
+                            <div class="dash-info-group">
+                                <span class="dash-label">API Endpoint</span>
+                            </div>
+                            <div class="code-box" style="margin-top: -0.5rem; margin-bottom: 0.5rem;">
+                                ${escapeHtml(u.api_endpoint || '-')}
+                            </div>
+                            <div class="dash-info-group">
+                                <span class="dash-label">节点状态API</span>
+                            </div>
+                            <div class="code-box" style="margin-top: -0.5rem; margin-bottom: 0.5rem;">
+                                ${escapeHtml(u.node_status_api_endpoint || '-')}
+                            </div>
+                            <div class="dash-info-group">
+                                <span class="dash-label">节点自动刷新</span>
+                                <span class="dash-value sm">${escapeHtml(u.node_status_refresh_interval || '10m')}</span>
+                            </div>
+                          `;
                     const strategy = u.cache_strategy === 'force' ? '强制' : '懒加载';
                     const toggleStrategy = u.cache_strategy === 'force' ? 'lazy' : 'force';
                     const toggleLabel = u.cache_strategy === 'force' ? '切换为懒缓存' : '切换为强制';
@@ -1713,21 +1759,10 @@
                             </div>
                             <div class="dash-card-body">
                                 <div class="dash-info-group">
-                                    <span class="dash-label">API Endpoint</span>
+                                    <span class="dash-label">类型</span>
+                                    <span class="dash-value sm">${escapeHtml(upstreamType)}</span>
                                 </div>
-                                <div class="code-box" style="margin-top: -0.5rem; margin-bottom: 0.5rem;">
-                                    ${escapeHtml(u.api_endpoint || '-')}
-                                </div>
-                                <div class="dash-info-group">
-                                    <span class="dash-label">节点状态API</span>
-                                </div>
-                                <div class="code-box" style="margin-top: -0.5rem; margin-bottom: 0.5rem;">
-                                    ${escapeHtml(u.node_status_api_endpoint || '-')}
-                                </div>
-                                <div class="dash-info-group">
-                                    <span class="dash-label">节点自动刷新</span>
-                                    <span class="dash-value sm">${escapeHtml(u.node_status_refresh_interval || '10m')}</span>
-                                </div>
+                                ${mergeDetailHtml}
                                 
                                 <div class="dash-info-group">
                                     <span class="dash-label">策略</span>
@@ -1850,14 +1885,38 @@
                 return;
             }
             const isEdit = !!data;
+            const currentUpstreamID = String(data?.id || '').trim();
+            const mergeDefaults = {
+                sources: [],
+                include_name_contains: [],
+                exclude_name_contains: [],
+                name_replacements: [],
+                rules: []
+            };
+            const initialMergeConfig = normalizeMergeConfigForUI(data?.merge_config || mergeDefaults);
             const html = `
                 <div class="form-group">
                     <label class="form-label">名称 *</label>
                     <input type="text" class="input" id="up-name" value="${escapeHtml(data?.name || '')}" required>
                 </div>
                 <div class="form-group">
+                    <label class="form-label">上游类型</label>
+                    <select class="input" id="up-type">
+                        <option value="single" ${(data?.type || 'single') === 'single' ? 'selected' : ''}>普通上游</option>
+                        <option value="merge" ${(data?.type || 'single') === 'merge' ? 'selected' : ''}>M类上游（节点合并）</option>
+                    </select>
+                </div>
+
+                <div id="single-upstream-fields">
+                <div class="form-group">
                     <label class="form-label">API端点地址 *</label>
-                    <input type="text" class="input" id="up-url" value="${escapeHtml(data?.api_endpoint || '')}" placeholder="https://..." required>
+                    <input type="text" class="input" id="up-url" value="${escapeHtml(data?.api_endpoint || '')}" placeholder="https://...">
+                    <div class="form-hint">普通上游必填；M类上游可留空（由来源上游聚合）。</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">M类配置（JSON）</label>
+                    <textarea class="input" id="up-merge-config" rows="8" placeholder='{"sources":[{"upstream_id":"xxx","prefix":"JSY|","enabled":true}],"include_name_contains":[],"exclude_name_contains":[],"name_replacements":[{"from":"HKG","to":"HK"}],"rules":[]}'>${escapeHtml(JSON.stringify(data?.merge_config || { sources: [], include_name_contains: [], exclude_name_contains: [], name_replacements: [], rules: [] }, null, 2))}</textarea>
+                    <div class="form-hint">仅M类上游生效。sources 中可配置每个来源上游前缀；支持名称包含/排除、名称替换与扩展规则。</div>
                 </div>
                 <div class="form-group">
                     <label class="form-label">节点状态API（可选）</label>
@@ -1897,6 +1956,40 @@
                     <button type="button" class="btn btn-secondary btn-sm mt-4" id="add-header-btn">+ 添加请求头</button>
                     <div class="form-hint">添加额外的请求头，如 Cookie、X-Custom-Header 等。上方固定字段优先级更高。</div>
                 </div>
+                </div>
+
+                <div id="merge-upstream-fields" class="hidden">
+                    <div class="form-group">
+                        <label class="form-label">来源上游（GUI配置）</label>
+                        <div id="merge-sources-list"></div>
+                        <button type="button" class="btn btn-secondary btn-sm mt-4" id="add-merge-source-btn">+ 添加来源上游</button>
+                        <div class="form-hint">仅可选择普通上游；M类上游与自身会自动隐藏，避免形成递归依赖。</div>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">名称包含（可选）</label>
+                        <textarea class="input" id="merge-include-text" rows="2" placeholder="例如: HK,JP,US（逗号或换行分隔）">${escapeHtml((initialMergeConfig.include_name_contains || []).join('\n'))}</textarea>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">名称排除（可选）</label>
+                        <textarea class="input" id="merge-exclude-text" rows="2" placeholder="例如: TEST,EXPIRE（逗号或换行分隔）">${escapeHtml((initialMergeConfig.exclude_name_contains || []).join('\n'))}</textarea>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">名称替换</label>
+                        <div id="merge-replacements-list"></div>
+                        <button type="button" class="btn btn-secondary btn-sm mt-4" id="add-merge-replacement-btn">+ 添加替换规则</button>
+                        <div class="form-hint">示例：HKG → HK</div>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">扩展过滤规则</label>
+                        <div id="merge-rules-list"></div>
+                        <button type="button" class="btn btn-secondary btn-sm mt-4" id="add-merge-rule-btn">+ 添加规则</button>
+                        <div class="form-hint">支持字段：name / protocol / host / port。操作：contains/not_contains/eq/ne/prefix/suffix/gt/lt/ge/le。</div>
+                    </div>
+                </div>
+
                 <div class="flex gap-2">
                     <div class="form-group" style="flex:1">
                         <label class="form-label">刷新周期</label>
@@ -1927,6 +2020,7 @@
 
                 const payload = {
                     name: $('#up-name').value.trim(),
+                    type: ($('#up-type')?.value || 'single').trim() || 'single',
                     api_endpoint: $('#up-url').value.trim(),
                     node_status_api_endpoint: $('#up-node-status-url').value.trim(),
                     node_status_refresh_interval: $('#up-node-status-interval').value.trim() || '10m',
@@ -1941,7 +2035,17 @@
                     enabled: $('#up-enabled').checked
                 };
 
+                if (payload.type === 'merge') {
+                    payload.merge_config = collectMergeConfigFromForm();
+                } else {
+                    payload.merge_config = mergeDefaults;
+                }
+
                 if (!payload.name) throw new Error('名称不能为空');
+                if (payload.type === 'single' && !payload.api_endpoint) throw new Error('普通上游必须填写API端点地址');
+                if (payload.type === 'merge' && (!payload.merge_config || !Array.isArray(payload.merge_config.sources) || payload.merge_config.sources.length === 0)) {
+                    throw new Error('M类上游至少需要一个来源上游');
+                }
 
                 const url = isEdit ? '/upstreams/' + data.id : '/upstreams';
                 const method = isEdit ? 'PUT' : 'POST';
@@ -1953,6 +2057,213 @@
 
             // Initialize custom headers list after modal is shown
             initCustomHeadersList(data?.custom_headers || {});
+
+            initMergeSourcesList(initialMergeConfig.sources, currentUpstreamID);
+            initMergeReplacementsList(initialMergeConfig.name_replacements || []);
+            initMergeRulesList(initialMergeConfig.rules || []);
+
+            const typeSelect = $('#up-type');
+            if (typeSelect) {
+                typeSelect.onchange = () => toggleUpstreamTypeFields(typeSelect.value);
+                toggleUpstreamTypeFields(typeSelect.value || 'single');
+            }
+        }
+
+        function normalizeMergeConfigForUI(config) {
+            const source = (config && typeof config === 'object') ? config : {};
+            return {
+                sources: Array.isArray(source.sources) ? source.sources : [],
+                include_name_contains: Array.isArray(source.include_name_contains) ? source.include_name_contains : [],
+                exclude_name_contains: Array.isArray(source.exclude_name_contains) ? source.exclude_name_contains : [],
+                name_replacements: Array.isArray(source.name_replacements) ? source.name_replacements : [],
+                rules: Array.isArray(source.rules) ? source.rules : []
+            };
+        }
+
+        function toggleUpstreamTypeFields(type) {
+            const isMerge = String(type || '').trim() === 'merge';
+            const singleWrap = $('#single-upstream-fields');
+            const mergeWrap = $('#merge-upstream-fields');
+            if (singleWrap) singleWrap.classList.toggle('hidden', isMerge);
+            if (mergeWrap) mergeWrap.classList.toggle('hidden', !isMerge);
+        }
+
+        function getMergeSourceCandidates(currentUpstreamID) {
+            const currentID = String(currentUpstreamID || '').trim();
+            return (cachedUpstreamsList || []).filter(item => {
+                if (!item || !item.id) return false;
+                if (item.id === currentID) return false;
+                const type = String(item.type || 'single').trim();
+                return type !== 'merge';
+            });
+        }
+
+        function initMergeSourcesList(sources, currentUpstreamID) {
+            const container = $('#merge-sources-list');
+            if (!container) return;
+            container.innerHTML = '';
+            const normalized = Array.isArray(sources) ? sources : [];
+            if (normalized.length === 0) {
+                addMergeSourceRow(currentUpstreamID);
+            } else {
+                normalized.forEach(source => {
+                    addMergeSourceRow(currentUpstreamID, source);
+                });
+            }
+            const addBtn = $('#add-merge-source-btn');
+            if (addBtn) {
+                addBtn.onclick = () => addMergeSourceRow(currentUpstreamID);
+            }
+        }
+
+        function addMergeSourceRow(currentUpstreamID, source = null) {
+            const container = $('#merge-sources-list');
+            if (!container) return;
+            const candidates = getMergeSourceCandidates(currentUpstreamID);
+            const selectedID = String(source?.upstream_id || '').trim();
+            const selectedPrefix = String(source?.prefix || '').trim();
+            const selectedEnabled = source?.enabled !== false;
+            const hasSelectedInCandidates = candidates.some(item => item.id === selectedID);
+
+            const row = document.createElement('div');
+            row.className = 'merge-source-row flex gap-2 mb-4';
+            row.style.alignItems = 'center';
+
+            let optionsHtml = '<option value="">请选择来源上游</option>';
+            candidates.forEach(item => {
+                const selected = item.id === selectedID ? 'selected' : '';
+                optionsHtml += `<option value="${escapeHtml(item.id)}" ${selected}>${escapeHtml(item.name || item.id)}</option>`;
+            });
+            if (selectedID && !hasSelectedInCandidates) {
+                optionsHtml += `<option value="${escapeHtml(selectedID)}" selected>${escapeHtml(selectedID)}（不可用）</option>`;
+            }
+
+            row.innerHTML = `
+                <select class="input merge-source-id" style="flex:2">${optionsHtml}</select>
+                <input type="text" class="input merge-source-prefix" placeholder="前缀，如 JSY|" value="${escapeHtml(selectedPrefix)}" style="flex:1.5">
+                <label class="text-sm" style="display:flex; align-items:center; gap:0.35rem; white-space:nowrap;"><input type="checkbox" class="merge-source-enabled" ${selectedEnabled ? 'checked' : ''}> 启用</label>
+                <button type="button" class="btn btn-danger btn-sm merge-source-remove">&times;</button>
+            `;
+            row.querySelector('.merge-source-remove').onclick = () => row.remove();
+            container.appendChild(row);
+        }
+
+        function initMergeReplacementsList(replacements) {
+            const container = $('#merge-replacements-list');
+            if (!container) return;
+            container.innerHTML = '';
+            const list = Array.isArray(replacements) ? replacements : [];
+            if (list.length === 0) {
+                addMergeReplacementRow();
+            } else {
+                list.forEach(item => {
+                    addMergeReplacementRow(item);
+                });
+            }
+            const addBtn = $('#add-merge-replacement-btn');
+            if (addBtn) addBtn.onclick = () => addMergeReplacementRow();
+        }
+
+        function addMergeReplacementRow(item = null) {
+            const container = $('#merge-replacements-list');
+            if (!container) return;
+            const row = document.createElement('div');
+            row.className = 'merge-replace-row flex gap-2 mb-4';
+            row.style.alignItems = 'center';
+            row.innerHTML = `
+                <input type="text" class="input merge-replace-from" placeholder="原字符" value="${escapeHtml(item?.from || '')}" style="flex:1">
+                <span class="text-sm text-muted">→</span>
+                <input type="text" class="input merge-replace-to" placeholder="替换为" value="${escapeHtml(item?.to || '')}" style="flex:1">
+                <button type="button" class="btn btn-danger btn-sm merge-replace-remove">&times;</button>
+            `;
+            row.querySelector('.merge-replace-remove').onclick = () => row.remove();
+            container.appendChild(row);
+        }
+
+        function initMergeRulesList(rules) {
+            const container = $('#merge-rules-list');
+            if (!container) return;
+            container.innerHTML = '';
+            const list = Array.isArray(rules) ? rules : [];
+            if (list.length === 0) {
+                addMergeRuleRow();
+            } else {
+                list.forEach(item => {
+                    addMergeRuleRow(item);
+                });
+            }
+            const addBtn = $('#add-merge-rule-btn');
+            if (addBtn) addBtn.onclick = () => addMergeRuleRow();
+        }
+
+        function addMergeRuleRow(item = null) {
+            const container = $('#merge-rules-list');
+            if (!container) return;
+            const field = String(item?.field || 'name').trim();
+            const op = String(item?.op || 'contains').trim();
+            const value = String(item?.value || '').trim();
+            const fields = ['name', 'protocol', 'host', 'port'];
+            const ops = ['contains', 'not_contains', 'eq', 'ne', 'prefix', 'suffix', 'gt', 'lt', 'ge', 'le'];
+            const fieldOptions = fields.map(f => `<option value="${f}" ${f === field ? 'selected' : ''}>${f}</option>`).join('');
+            const opOptions = ops.map(o => `<option value="${o}" ${o === op ? 'selected' : ''}>${o}</option>`).join('');
+
+            const row = document.createElement('div');
+            row.className = 'merge-rule-row flex gap-2 mb-4';
+            row.style.alignItems = 'center';
+            row.innerHTML = `
+                <select class="input merge-rule-field" style="flex:1">${fieldOptions}</select>
+                <select class="input merge-rule-op" style="flex:1.2">${opOptions}</select>
+                <input type="text" class="input merge-rule-value" placeholder="规则值" value="${escapeHtml(value)}" style="flex:1.5">
+                <button type="button" class="btn btn-danger btn-sm merge-rule-remove">&times;</button>
+            `;
+            row.querySelector('.merge-rule-remove').onclick = () => row.remove();
+            container.appendChild(row);
+        }
+
+        function parseListText(raw) {
+            return String(raw || '')
+                .split(/[\n,]/)
+                .map(item => item.trim())
+                .filter(Boolean);
+        }
+
+        function collectMergeConfigFromForm() {
+            const sources = [];
+            $$('#merge-sources-list .merge-source-row').forEach(row => {
+                const upstreamID = row.querySelector('.merge-source-id')?.value?.trim() || '';
+                const prefix = row.querySelector('.merge-source-prefix')?.value?.trim() || '';
+                const enabled = !!row.querySelector('.merge-source-enabled')?.checked;
+                if (upstreamID) {
+                    sources.push({ upstream_id: upstreamID, prefix, enabled });
+                }
+            });
+
+            const nameReplacements = [];
+            $$('#merge-replacements-list .merge-replace-row').forEach(row => {
+                const from = row.querySelector('.merge-replace-from')?.value?.trim() || '';
+                const to = row.querySelector('.merge-replace-to')?.value?.trim() || '';
+                if (from) {
+                    nameReplacements.push({ from, to });
+                }
+            });
+
+            const rules = [];
+            $$('#merge-rules-list .merge-rule-row').forEach(row => {
+                const field = row.querySelector('.merge-rule-field')?.value?.trim() || '';
+                const op = row.querySelector('.merge-rule-op')?.value?.trim() || '';
+                const value = row.querySelector('.merge-rule-value')?.value?.trim() || '';
+                if (field && op && value) {
+                    rules.push({ field, op, value });
+                }
+            });
+
+            return {
+                sources,
+                include_name_contains: parseListText($('#merge-include-text')?.value || ''),
+                exclude_name_contains: parseListText($('#merge-exclude-text')?.value || ''),
+                name_replacements: nameReplacements,
+                rules
+            };
         }
 
         let cachedUpstreams = [];

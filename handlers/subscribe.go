@@ -88,6 +88,8 @@ type updateKeyRequest struct {
 type upstreamRequest struct {
 	ID                        string            `json:"id"`
 	Name                      string            `json:"name"`
+	Type                      string            `json:"type"`
+	MergeConfig               store.MergeConfig `json:"merge_config"`
 	APIEndpoint               string            `json:"api_endpoint"`
 	NodeStatusAPIEndpoint     string            `json:"node_status_api_endpoint"`
 	NodeStatusRefreshInterval string            `json:"node_status_refresh_interval"`
@@ -328,49 +330,146 @@ func (h *SubscribeHandler) RefreshUpstreamCache(upstreamID, reason, downstreamUA
 		return errors.New("上游不存在")
 	}
 	if strings.TrimSpace(upstream.APIEndpoint) == "" {
-		return errors.New("请先配置API端点地址")
+		if upstream.Type != store.UpstreamTypeMerge {
+			return errors.New("请先配置API端点地址")
+		}
+	}
+
+	if upstream.Type == store.UpstreamTypeMerge {
+		return h.refreshMergeUpstreamCache(upstream, reason, downstreamUA)
+	}
+	return h.refreshSingleUpstreamCache(upstream, reason, downstreamUA)
+}
+
+func (h *SubscribeHandler) refreshSingleUpstreamCache(upstream store.Upstream, reason, downstreamUA string) error {
+	fetched, err := h.fetchSingleUpstreamContent(upstream, downstreamUA)
+	if err != nil {
+		return err
+	}
+	cacheVariantUA := strings.TrimSpace(downstreamUA)
+	h.state.SetCache(upstream.ID, cacheVariantUA, &store.CachedSubscription{
+		Body:          fetched.Body,
+		Headers:       fetched.Headers,
+		StatusCode:    fetched.StatusCode,
+		UpdatedAt:     time.Now(),
+		SourceURL:     fetched.SourceURL,
+		TrafficStatus: fetched.TrafficStatus,
+	})
+	log.Printf("订阅缓存刷新成功 upstream=%s reason=%s source=%s bytes=%d", upstream.ID, reason, fetched.SourceURL, len(fetched.Body))
+	return nil
+}
+
+func (h *SubscribeHandler) refreshMergeUpstreamCache(upstream store.Upstream, reason, downstreamUA string) error {
+	nodes := make([]MergedNode, 0)
+	for _, source := range upstream.MergeConfig.Sources {
+		if source.Enabled != nil && !*source.Enabled {
+			continue
+		}
+		sourceUpstream, ok := h.state.GetUpstream(source.UpstreamID)
+		if !ok {
+			continue
+		}
+		if !sourceUpstream.Enabled {
+			continue
+		}
+		if sourceUpstream.Type == store.UpstreamTypeMerge {
+			continue
+		}
+		fetched, err := h.fetchSingleUpstreamContent(sourceUpstream, downstreamUA)
+		if err != nil {
+			log.Printf("M类上游来源拉取失败 merge=%s source=%s: %v", upstream.ID, source.UpstreamID, err)
+			continue
+		}
+		parsed, err := ParseSubscriptionNodes(fetched.Body)
+		if err != nil {
+			log.Printf("M类上游来源解析失败 merge=%s source=%s: %v", upstream.ID, source.UpstreamID, err)
+			continue
+		}
+		for _, node := range parsed {
+			if source.Prefix != "" {
+				node.Name = source.Prefix + node.Name
+			}
+			nodes = append(nodes, node)
+		}
+	}
+
+	nodes = ApplyNameReplacements(nodes, upstream.MergeConfig.NameReplacements)
+	nodes = FilterNodes(nodes, upstream.MergeConfig.IncludeNameContains, upstream.MergeConfig.ExcludeNameContains, upstream.MergeConfig.Rules)
+	if len(nodes) == 0 {
+		return errors.New("M类上游合并后没有可用节点")
+	}
+
+	body, err := RenderStandardV2RaySubscription(nodes)
+	if err != nil {
+		return err
+	}
+	headers := map[string][]string{
+		"Content-Type":              {"text/plain; charset=utf-8"},
+		"Content-Transfer-Encoding": {"base64"},
+	}
+	h.state.SetCache(upstream.ID, downstreamUA, &store.CachedSubscription{
+		Body:       body,
+		Headers:    headers,
+		StatusCode: http.StatusOK,
+		UpdatedAt:  time.Now(),
+		SourceURL:  "merge://" + upstream.ID,
+	})
+	log.Printf("M类订阅缓存刷新成功 upstream=%s reason=%s nodes=%d bytes=%d", upstream.ID, reason, len(nodes), len(body))
+	return nil
+}
+
+type fetchedSubscription struct {
+	Body          []byte
+	Headers       map[string][]string
+	StatusCode    int
+	SourceURL     string
+	TrafficStatus store.TrafficStatus
+}
+
+func (h *SubscribeHandler) fetchSingleUpstreamContent(upstream store.Upstream, downstreamUA string) (*fetchedSubscription, error) {
+	if strings.TrimSpace(upstream.APIEndpoint) == "" {
+		return nil, errors.New("请先配置API端点地址")
 	}
 
 	headers := buildUpstreamRequestHeaders(upstream)
 
 	resp, err := h.httpClient.MakeRequest(http.MethodGet, upstream.APIEndpoint, headers)
 	if err != nil {
-		return fmt.Errorf("请求上游API失败: %w", err)
+		return nil, fmt.Errorf("请求上游API失败: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("上游API返回状态码: %d", resp.StatusCode)
+		return nil, fmt.Errorf("上游API返回状态码: %d", resp.StatusCode)
 	}
 
 	var subscribeResp SubscribeResponse
 	if err := utils.ParseJSONResponse(resp, &subscribeResp); err != nil {
-		return fmt.Errorf("解析上游响应失败: %w", err)
+		return nil, fmt.Errorf("解析上游响应失败: %w", err)
 	}
 	if subscribeResp.Data.SubscribeURL == "" {
-		return errors.New("上游响应缺少subscribe_url")
+		return nil, errors.New("上游响应缺少subscribe_url")
 	}
 
 	fetchUA := strings.TrimSpace(downstreamUA)
 	if fetchUA == "" {
 		fetchUA = upstream.RequestUserAgent
 	}
-	cacheVariantUA := strings.TrimSpace(downstreamUA)
 	contentHeaders := map[string]string{}
 	if fetchUA != "" {
 		contentHeaders["User-Agent"] = fetchUA
 	}
 	contentResp, err := h.httpClient.MakeRequest(http.MethodGet, subscribeResp.Data.SubscribeURL, contentHeaders)
 	if err != nil {
-		return fmt.Errorf("请求订阅链接失败: %w", err)
+		return nil, fmt.Errorf("请求订阅链接失败: %w", err)
 	}
 	defer contentResp.Body.Close()
 	if contentResp.StatusCode != http.StatusOK {
-		return fmt.Errorf("订阅内容返回状态码: %d", contentResp.StatusCode)
+		return nil, fmt.Errorf("订阅内容返回状态码: %d", contentResp.StatusCode)
 	}
 
 	body, err := io.ReadAll(contentResp.Body)
 	if err != nil {
-		return fmt.Errorf("读取订阅内容失败: %w", err)
+		return nil, fmt.Errorf("读取订阅内容失败: %w", err)
 	}
 
 	headersCopy := make(map[string][]string)
@@ -378,12 +477,10 @@ func (h *SubscribeHandler) RefreshUpstreamCache(upstreamID, reason, downstreamUA
 		headersCopy[k] = append([]string(nil), values...)
 	}
 	mergeAllowedPassthroughHeaders(headersCopy, resp.Header)
-
-	h.state.SetCache(upstreamID, cacheVariantUA, &store.CachedSubscription{
+	return &fetchedSubscription{
 		Body:       body,
 		Headers:    headersCopy,
 		StatusCode: contentResp.StatusCode,
-		UpdatedAt:  time.Now(),
 		SourceURL:  subscribeResp.Data.SubscribeURL,
 		TrafficStatus: store.TrafficStatus{
 			ExpiredAt:      subscribeResp.Data.ExpiredAt,
@@ -393,10 +490,7 @@ func (h *SubscribeHandler) RefreshUpstreamCache(upstreamID, reason, downstreamUA
 			PlanName:       subscribeResp.Data.Plan.Name,
 			ResetDay:       subscribeResp.Data.ResetDay,
 		},
-	})
-
-	log.Printf("订阅缓存刷新成功 upstream=%s reason=%s source=%s bytes=%d", upstreamID, reason, subscribeResp.Data.SubscribeURL, len(body))
-	return nil
+	}, nil
 }
 
 func makeRefreshLockKey(upstreamID, userAgent string) string {
@@ -504,12 +598,14 @@ func (h *SubscribeHandler) AdminStatus(c *gin.Context) {
 		status := gin.H{
 			"id":                           u.ID,
 			"name":                         u.Name,
+			"type":                         u.Type,
+			"merge_config":                 u.MergeConfig,
 			"enabled":                      u.Enabled,
 			"cache_strategy":               u.CacheStrategy,
 			"refresh_interval":             u.RefreshInterval,
 			"has_cache":                    hasCache,
 			"cache_variants":               h.state.CacheVariantCount(u.ID),
-			"configured":                   u.APIEndpoint != "",
+			"configured":                   u.APIEndpoint != "" || (u.Type == store.UpstreamTypeMerge && len(u.MergeConfig.Sources) > 0),
 			"node_status_api_endpoint":     u.NodeStatusAPIEndpoint,
 			"node_status_refresh_interval": u.NodeStatusRefreshInterval,
 		}
@@ -657,6 +753,8 @@ func (h *SubscribeHandler) AdminAddUpstream(c *gin.Context) {
 	}
 	upstream := store.Upstream{
 		Name:                      strings.TrimSpace(req.Name),
+		Type:                      strings.TrimSpace(req.Type),
+		MergeConfig:               req.MergeConfig,
 		APIEndpoint:               strings.TrimSpace(req.APIEndpoint),
 		NodeStatusAPIEndpoint:     strings.TrimSpace(req.NodeStatusAPIEndpoint),
 		NodeStatusRefreshInterval: strings.TrimSpace(req.NodeStatusRefreshInterval),
@@ -704,6 +802,8 @@ func (h *SubscribeHandler) AdminUpdateUpstream(c *gin.Context) {
 	}
 
 	existing.Name = strings.TrimSpace(req.Name)
+	existing.Type = strings.TrimSpace(req.Type)
+	existing.MergeConfig = req.MergeConfig
 	existing.APIEndpoint = strings.TrimSpace(req.APIEndpoint)
 	existing.NodeStatusAPIEndpoint = strings.TrimSpace(req.NodeStatusAPIEndpoint)
 	existing.NodeStatusRefreshInterval = strings.TrimSpace(req.NodeStatusRefreshInterval)
