@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -21,6 +23,10 @@ type MergedNode struct {
 	Host     string
 	Port     int
 	render   func(name string) (string, error)
+}
+
+type ClashRenderOptions struct {
+	AdditionalRules []string
 }
 
 func ParseSubscriptionNodes(body []byte) ([]MergedNode, error) {
@@ -46,13 +52,99 @@ func ParseSubscriptionNodes(body []byte) ([]MergedNode, error) {
 }
 
 func ApplyNameReplacements(nodes []MergedNode, replacements []store.MergeNameReplacement) []MergedNode {
-	for idx := range nodes {
-		for _, item := range replacements {
-			if strings.TrimSpace(item.From) == "" {
+	type compiledReplacement struct {
+		literal string
+		re      *regexp.Regexp
+		to      string
+	}
+	compiled := make([]compiledReplacement, 0, len(replacements))
+	for _, item := range replacements {
+		from := strings.TrimSpace(item.From)
+		if from == "" {
+			continue
+		}
+		if pattern, ok := unwrapRegexPattern(from); ok {
+			re, err := regexp.Compile(pattern)
+			if err != nil {
 				continue
 			}
-			nodes[idx].Name = strings.ReplaceAll(nodes[idx].Name, item.From, item.To)
+			compiled = append(compiled, compiledReplacement{re: re, to: item.To})
+			continue
 		}
+		compiled = append(compiled, compiledReplacement{literal: from, to: item.To})
+	}
+	if len(compiled) == 0 {
+		return nodes
+	}
+	for idx := range nodes {
+		for _, item := range compiled {
+			if item.re != nil {
+				nodes[idx].Name = item.re.ReplaceAllString(nodes[idx].Name, item.to)
+				continue
+			}
+			nodes[idx].Name = strings.ReplaceAll(nodes[idx].Name, item.literal, item.to)
+		}
+	}
+	return nodes
+}
+
+func DedupeMergedNodes(nodes []MergedNode) []MergedNode {
+	seen := make(map[string]struct{}, len(nodes))
+	result := make([]MergedNode, 0, len(nodes))
+	for _, node := range nodes {
+		name := strings.TrimSpace(strings.ToLower(node.Name))
+		key := strings.ToLower(strings.TrimSpace(node.Protocol)) + "|" + strings.TrimSpace(node.Host) + "|" + strconv.Itoa(node.Port) + "|" + name
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, node)
+	}
+	return result
+}
+
+func SortMergedNodesByName(nodes []MergedNode) []MergedNode {
+	if len(nodes) <= 1 {
+		return nodes
+	}
+	sort.SliceStable(nodes, func(i, j int) bool {
+		left := strings.ToLower(strings.TrimSpace(nodes[i].Name))
+		right := strings.ToLower(strings.TrimSpace(nodes[j].Name))
+		if left == right {
+			return strings.ToLower(nodes[i].Protocol) < strings.ToLower(nodes[j].Protocol)
+		}
+		return left < right
+	})
+	return nodes
+}
+
+func ApplyProtocolEmoji(nodes []MergedNode) []MergedNode {
+	emojiByProtocol := map[string]string{
+		"vmess":     "🔷",
+		"vless":     "🟪",
+		"trojan":    "🐴",
+		"ss":        "🟢",
+		"ssr":       "🟠",
+		"hysteria":  "🌪️",
+		"hysteria2": "⚡",
+		"tuic":      "🚀",
+		"wireguard": "🛡️",
+		"socks5":    "🧦",
+		"http":      "🌐",
+	}
+	for i := range nodes {
+		name := strings.TrimSpace(nodes[i].Name)
+		if name == "" {
+			continue
+		}
+		emoji := emojiByProtocol[strings.ToLower(strings.TrimSpace(nodes[i].Protocol))]
+		if emoji == "" {
+			continue
+		}
+		if strings.HasPrefix(name, emoji+" ") {
+			continue
+		}
+		nodes[i].Name = emoji + " " + name
 	}
 	return nodes
 }
@@ -95,7 +187,7 @@ func RenderStandardV2RaySubscription(nodes []MergedNode) ([]byte, error) {
 	return []byte(encoded), nil
 }
 
-func RenderClashSubscription(nodes []MergedNode, upstreamRaw []byte, clashCfg store.ClashConfig) ([]byte, error) {
+func RenderClashSubscription(nodes []MergedNode, upstreamRaw []byte, clashCfg store.ClashConfig, opts ...ClashRenderOptions) ([]byte, error) {
 	proxies := make([]map[string]interface{}, 0, len(nodes))
 	proxyNames := make([]string, 0, len(nodes))
 	for _, node := range nodes {
@@ -119,7 +211,11 @@ func RenderClashSubscription(nodes []MergedNode, upstreamRaw []byte, clashCfg st
 	if !injectProxyNamesIntoGroups(root, proxyNames) {
 		root["proxy-groups"] = defaultClashProxyGroups(proxyNames)
 	}
-	ensureClashRules(root)
+	additionalRules := []string{}
+	if len(opts) > 0 {
+		additionalRules = append(additionalRules, opts[0].AdditionalRules...)
+	}
+	ensureClashRules(root, additionalRules)
 
 	out, err := yaml.Marshal(root)
 	if err != nil {
@@ -220,6 +316,16 @@ func uriToSurgeProxy(line string) (string, string, error) {
 	switch {
 	case strings.HasPrefix(lower, "ss://"):
 		return ssURIToSurgeProxy(trimmed)
+	case strings.HasPrefix(lower, "ssr://"):
+		converted, err := ssrURIToSSURI(trimmed)
+		if err != nil {
+			return "", "", err
+		}
+		return ssURIToSurgeProxy(converted)
+	case strings.HasPrefix(lower, "socks5://") || strings.HasPrefix(lower, "socks://"):
+		return socks5URIToSurgeProxy(trimmed)
+	case strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://"):
+		return httpURIToSurgeProxy(trimmed)
 	case strings.HasPrefix(lower, "trojan://"):
 		return trojanURIToSurgeProxy(trimmed)
 	case strings.HasPrefix(lower, "vmess://"):
@@ -229,6 +335,67 @@ func uriToSurgeProxy(line string) (string, string, error) {
 	default:
 		return "", "", errors.New("unsupported surge protocol")
 	}
+}
+
+func socks5URIToSurgeProxy(line string) (string, string, error) {
+	core, fragment := splitCoreAndFragment(line)
+	u, err := url.Parse(core)
+	if err != nil {
+		return "", "", err
+	}
+	name, _ := url.QueryUnescape(fragment)
+	if name == "" {
+		name = "socks5"
+	}
+	server := u.Hostname()
+	port := parsePort(u.Port())
+	if server == "" || port <= 0 {
+		return "", "", errors.New("invalid socks5")
+	}
+	lineOut := fmt.Sprintf("%s = socks5, %s, %d", sanitizeSurgeName(name), server, port)
+	if u.User != nil {
+		username := strings.TrimSpace(u.User.Username())
+		password, _ := u.User.Password()
+		if username != "" {
+			lineOut += ", username=" + username
+		}
+		if password != "" {
+			lineOut += ", password=" + password
+		}
+	}
+	return sanitizeSurgeName(name), lineOut, nil
+}
+
+func httpURIToSurgeProxy(line string) (string, string, error) {
+	core, fragment := splitCoreAndFragment(line)
+	u, err := url.Parse(core)
+	if err != nil {
+		return "", "", err
+	}
+	name, _ := url.QueryUnescape(fragment)
+	if name == "" {
+		name = "http"
+	}
+	server := u.Hostname()
+	port := parsePort(u.Port())
+	if server == "" || port <= 0 {
+		return "", "", errors.New("invalid http")
+	}
+	lineOut := fmt.Sprintf("%s = http, %s, %d", sanitizeSurgeName(name), server, port)
+	if u.User != nil {
+		username := strings.TrimSpace(u.User.Username())
+		password, _ := u.User.Password()
+		if username != "" {
+			lineOut += ", username=" + username
+		}
+		if password != "" {
+			lineOut += ", password=" + password
+		}
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		lineOut += ", tls=true"
+	}
+	return sanitizeSurgeName(name), lineOut, nil
 }
 
 func ssURIToSurgeProxy(line string) (string, string, error) {
@@ -425,6 +592,20 @@ func uriToSingBoxOutbound(line string) (map[string]interface{}, error) {
 		return trojanURIToSingBoxOutbound(trimmed)
 	case strings.HasPrefix(lower, "ss://"):
 		return ssURIToSingBoxOutbound(trimmed)
+	case strings.HasPrefix(lower, "ssr://"):
+		converted, err := ssrURIToSSURI(trimmed)
+		if err != nil {
+			return nil, err
+		}
+		return ssURIToSingBoxOutbound(converted)
+	case strings.HasPrefix(lower, "socks5://") || strings.HasPrefix(lower, "socks://"):
+		return socks5URIToSingBoxOutbound(trimmed)
+	case strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://"):
+		return httpURIToSingBoxOutbound(trimmed)
+	case strings.HasPrefix(lower, "wireguard://") || strings.HasPrefix(lower, "wg://"):
+		return wireguardURIToSingBoxOutbound(trimmed)
+	case strings.HasPrefix(lower, "hysteria://") || strings.HasPrefix(lower, "hy://"):
+		return hysteriaURIToSingBoxOutbound(trimmed)
 	case strings.HasPrefix(lower, "hysteria2://") || strings.HasPrefix(lower, "hy2://"):
 		return hysteria2URIToSingBoxOutbound(trimmed)
 	case strings.HasPrefix(lower, "tuic://"):
@@ -456,9 +637,39 @@ func vmessURIToSingBoxOutbound(line string) (map[string]interface{}, error) {
 	}
 	if network := asString(cfg["net"]); network != "" {
 		outbound["network"] = network
+		switch strings.ToLower(network) {
+		case "ws":
+			transport := map[string]interface{}{"type": "ws"}
+			if path := asString(cfg["path"]); path != "" {
+				transport["path"] = path
+			}
+			if host := asString(cfg["host"]); host != "" {
+				transport["headers"] = map[string]interface{}{"Host": host}
+			}
+			outbound["transport"] = transport
+		case "grpc":
+			serviceName := asString(cfg["path"])
+			if serviceName == "" {
+				serviceName = asString(cfg["serviceName"])
+			}
+			transport := map[string]interface{}{"type": "grpc"}
+			if serviceName != "" {
+				transport["service_name"] = serviceName
+			}
+			outbound["transport"] = transport
+		}
 	}
 	if tls := strings.ToLower(asString(cfg["tls"])); tls == "tls" || tls == "true" {
-		outbound["tls"] = map[string]interface{}{"enabled": true, "server_name": asString(cfg["host"])}
+		tlsMap := map[string]interface{}{"enabled": true}
+		if sni := asString(cfg["sni"]); sni != "" {
+			tlsMap["server_name"] = sni
+		} else if host := asString(cfg["host"]); host != "" {
+			tlsMap["server_name"] = host
+		}
+		if fp := asString(cfg["fp"]); fp != "" {
+			tlsMap["utls"] = map[string]interface{}{"enabled": true, "fingerprint": fp}
+		}
+		outbound["tls"] = tlsMap
 	}
 	if asString(outbound["server"]) == "" || asInt(outbound["server_port"]) <= 0 || asString(outbound["uuid"]) == "" {
 		return nil, errors.New("invalid vmess")
@@ -486,13 +697,61 @@ func vlessURIToSingBoxOutbound(line string) (map[string]interface{}, error) {
 	}
 	if network := q.Get("type"); network != "" {
 		outbound["network"] = network
+		switch strings.ToLower(network) {
+		case "ws":
+			transport := map[string]interface{}{"type": "ws"}
+			if path := strings.TrimSpace(q.Get("path")); path != "" {
+				transport["path"] = path
+			}
+			if host := strings.TrimSpace(q.Get("host")); host != "" {
+				transport["headers"] = map[string]interface{}{"Host": host}
+			}
+			outbound["transport"] = transport
+		case "grpc":
+			transport := map[string]interface{}{"type": "grpc"}
+			if serviceName := firstNonEmpty(strings.TrimSpace(q.Get("serviceName")), strings.TrimSpace(q.Get("service_name"))); serviceName != "" {
+				transport["service_name"] = serviceName
+			}
+			outbound["transport"] = transport
+		case "httpupgrade":
+			transport := map[string]interface{}{"type": "httpupgrade"}
+			if path := strings.TrimSpace(q.Get("path")); path != "" {
+				transport["path"] = path
+			}
+			outbound["transport"] = transport
+		}
 	}
-	if strings.EqualFold(q.Get("security"), "tls") {
+	security := strings.ToLower(strings.TrimSpace(q.Get("security")))
+	if security == "tls" || security == "reality" {
 		tlsMap := map[string]interface{}{"enabled": true}
-		if sni := q.Get("sni"); sni != "" {
+		if sni := strings.TrimSpace(q.Get("sni")); sni != "" {
 			tlsMap["server_name"] = sni
 		}
+		if fp := strings.TrimSpace(q.Get("fp")); fp != "" {
+			tlsMap["utls"] = map[string]interface{}{"enabled": true, "fingerprint": fp}
+		}
+		if parseBoolString(q.Get("allowInsecure")) {
+			tlsMap["insecure"] = true
+		}
+		if security == "reality" {
+			reality := map[string]interface{}{}
+			if pbk := strings.TrimSpace(q.Get("pbk")); pbk != "" {
+				reality["public_key"] = pbk
+			}
+			if sid := strings.TrimSpace(q.Get("sid")); sid != "" {
+				reality["short_id"] = sid
+			}
+			if spider := strings.TrimSpace(q.Get("spx")); spider != "" {
+				reality["spider_x"] = spider
+			}
+			if len(reality) > 0 {
+				tlsMap["reality"] = reality
+			}
+		}
 		outbound["tls"] = tlsMap
+	}
+	if flow := strings.TrimSpace(q.Get("flow")); flow != "" {
+		outbound["flow"] = flow
 	}
 	if asString(outbound["server"]) == "" || asInt(outbound["server_port"]) <= 0 || asString(outbound["uuid"]) == "" {
 		return nil, errors.New("invalid vless")
@@ -523,7 +782,34 @@ func trojanURIToSingBoxOutbound(line string) (map[string]interface{}, error) {
 		"password":    password,
 	}
 	if sni := q.Get("sni"); sni != "" {
-		outbound["tls"] = map[string]interface{}{"enabled": true, "server_name": sni}
+		tlsMap := map[string]interface{}{"enabled": true, "server_name": sni}
+		if fp := strings.TrimSpace(q.Get("fp")); fp != "" {
+			tlsMap["utls"] = map[string]interface{}{"enabled": true, "fingerprint": fp}
+		}
+		if parseBoolString(q.Get("allowInsecure")) {
+			tlsMap["insecure"] = true
+		}
+		outbound["tls"] = tlsMap
+	}
+	if network := strings.ToLower(strings.TrimSpace(q.Get("type"))); network != "" {
+		outbound["network"] = network
+		switch network {
+		case "ws":
+			transport := map[string]interface{}{"type": "ws"}
+			if path := strings.TrimSpace(q.Get("path")); path != "" {
+				transport["path"] = path
+			}
+			if host := strings.TrimSpace(q.Get("host")); host != "" {
+				transport["headers"] = map[string]interface{}{"Host": host}
+			}
+			outbound["transport"] = transport
+		case "grpc":
+			transport := map[string]interface{}{"type": "grpc"}
+			if serviceName := firstNonEmpty(strings.TrimSpace(q.Get("serviceName")), strings.TrimSpace(q.Get("service_name"))); serviceName != "" {
+				transport["service_name"] = serviceName
+			}
+			outbound["transport"] = transport
+		}
 	}
 	if asString(outbound["server"]) == "" || asInt(outbound["server_port"]) <= 0 || asString(outbound["password"]) == "" {
 		return nil, errors.New("invalid trojan")
@@ -574,6 +860,153 @@ func ssURIToSingBoxOutbound(line string) (map[string]interface{}, error) {
 	return outbound, nil
 }
 
+func socks5URIToSingBoxOutbound(line string) (map[string]interface{}, error) {
+	core, fragment := splitCoreAndFragment(line)
+	u, err := url.Parse(core)
+	if err != nil {
+		return nil, err
+	}
+	tag, _ := url.QueryUnescape(fragment)
+	if tag == "" {
+		tag = "socks5"
+	}
+	outbound := map[string]interface{}{
+		"type":        "socks",
+		"tag":         tag,
+		"server":      u.Hostname(),
+		"server_port": parsePort(u.Port()),
+	}
+	if u.User != nil {
+		if username := strings.TrimSpace(u.User.Username()); username != "" {
+			outbound["username"] = username
+		}
+		if password, _ := u.User.Password(); strings.TrimSpace(password) != "" {
+			outbound["password"] = password
+		}
+	}
+	if asString(outbound["server"]) == "" || asInt(outbound["server_port"]) <= 0 {
+		return nil, errors.New("invalid socks5")
+	}
+	return outbound, nil
+}
+
+func httpURIToSingBoxOutbound(line string) (map[string]interface{}, error) {
+	core, fragment := splitCoreAndFragment(line)
+	u, err := url.Parse(core)
+	if err != nil {
+		return nil, err
+	}
+	tag, _ := url.QueryUnescape(fragment)
+	if tag == "" {
+		tag = "http"
+	}
+	outbound := map[string]interface{}{
+		"type":        "http",
+		"tag":         tag,
+		"server":      u.Hostname(),
+		"server_port": parsePort(u.Port()),
+	}
+	if u.User != nil {
+		if username := strings.TrimSpace(u.User.Username()); username != "" {
+			outbound["username"] = username
+		}
+		if password, _ := u.User.Password(); strings.TrimSpace(password) != "" {
+			outbound["password"] = password
+		}
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		outbound["tls"] = map[string]interface{}{"enabled": true, "server_name": u.Hostname()}
+	}
+	if asString(outbound["server"]) == "" || asInt(outbound["server_port"]) <= 0 {
+		return nil, errors.New("invalid http")
+	}
+	return outbound, nil
+}
+
+func wireguardURIToSingBoxOutbound(line string) (map[string]interface{}, error) {
+	core, fragment := splitCoreAndFragment(line)
+	u, err := url.Parse(core)
+	if err != nil {
+		return nil, err
+	}
+	q := u.Query()
+	tag, _ := url.QueryUnescape(fragment)
+	if tag == "" {
+		tag = "wireguard"
+	}
+	peerPublicKey := strings.TrimSpace(q.Get("publickey"))
+	if peerPublicKey == "" {
+		peerPublicKey = strings.TrimSpace(q.Get("peer_public_key"))
+	}
+	privateKey := strings.TrimSpace(q.Get("privatekey"))
+	if privateKey == "" {
+		privateKey = strings.TrimSpace(q.Get("private_key"))
+	}
+	outbound := map[string]interface{}{
+		"type":            "wireguard",
+		"tag":             tag,
+		"server":          u.Hostname(),
+		"server_port":     parsePort(u.Port()),
+		"private_key":     privateKey,
+		"peer_public_key": peerPublicKey,
+	}
+	if address := strings.TrimSpace(q.Get("address")); address != "" {
+		outbound["local_address"] = strings.Split(address, ",")
+	}
+	if reserved := strings.TrimSpace(q.Get("reserved")); reserved != "" {
+		outbound["reserved"] = strings.Split(reserved, ",")
+	}
+	if mtu := parsePort(q.Get("mtu")); mtu > 0 {
+		outbound["mtu"] = mtu
+	}
+	if asString(outbound["server"]) == "" || asInt(outbound["server_port"]) <= 0 || asString(outbound["private_key"]) == "" || asString(outbound["peer_public_key"]) == "" {
+		return nil, errors.New("invalid wireguard")
+	}
+	return outbound, nil
+}
+
+func hysteriaURIToSingBoxOutbound(line string) (map[string]interface{}, error) {
+	core, fragment := splitCoreAndFragment(line)
+	u, err := url.Parse(core)
+	if err != nil {
+		return nil, err
+	}
+	q := u.Query()
+	tag, _ := url.QueryUnescape(fragment)
+	if tag == "" {
+		tag = "hysteria"
+	}
+	auth := strings.TrimSpace(q.Get("auth"))
+	if auth == "" {
+		auth = strings.TrimSpace(q.Get("auth_str"))
+	}
+	outbound := map[string]interface{}{
+		"type":        "hysteria",
+		"tag":         tag,
+		"server":      u.Hostname(),
+		"server_port": parsePort(u.Port()),
+	}
+	if auth != "" {
+		outbound["auth_str"] = auth
+	}
+	if upMbps := parsePort(q.Get("upmbps")); upMbps > 0 {
+		outbound["up_mbps"] = upMbps
+	}
+	if downMbps := parsePort(q.Get("downmbps")); downMbps > 0 {
+		outbound["down_mbps"] = downMbps
+	}
+	if obfs := strings.TrimSpace(q.Get("obfs")); obfs != "" {
+		outbound["obfs"] = obfs
+	}
+	if sni := q.Get("sni"); sni != "" {
+		outbound["tls"] = map[string]interface{}{"enabled": true, "server_name": sni}
+	}
+	if asString(outbound["server"]) == "" || asInt(outbound["server_port"]) <= 0 {
+		return nil, errors.New("invalid hysteria")
+	}
+	return outbound, nil
+}
+
 func hysteria2URIToSingBoxOutbound(line string) (map[string]interface{}, error) {
 	core, fragment := splitCoreAndFragment(line)
 	u, err := url.Parse(core)
@@ -597,7 +1030,21 @@ func hysteria2URIToSingBoxOutbound(line string) (map[string]interface{}, error) 
 		"password":    password,
 	}
 	if sni := q.Get("sni"); sni != "" {
-		outbound["tls"] = map[string]interface{}{"enabled": true, "server_name": sni}
+		tlsMap := map[string]interface{}{"enabled": true, "server_name": sni}
+		if parseBoolString(q.Get("insecure")) || parseBoolString(q.Get("allowInsecure")) {
+			tlsMap["insecure"] = true
+		}
+		if alpn := splitCSV(q.Get("alpn")); len(alpn) > 0 {
+			tlsMap["alpn"] = alpn
+		}
+		outbound["tls"] = tlsMap
+	}
+	if obfs := strings.TrimSpace(q.Get("obfs")); obfs != "" {
+		obfsMap := map[string]interface{}{"type": obfs}
+		if pwd := firstNonEmpty(strings.TrimSpace(q.Get("obfs-password")), strings.TrimSpace(q.Get("obfs_password"))); pwd != "" {
+			obfsMap["password"] = pwd
+		}
+		outbound["obfs"] = obfsMap
 	}
 	if asString(outbound["server"]) == "" || asInt(outbound["server_port"]) <= 0 || asString(outbound["password"]) == "" {
 		return nil, errors.New("invalid hysteria2")
@@ -623,6 +1070,23 @@ func tuicURIToSingBoxOutbound(line string) (map[string]interface{}, error) {
 		"server_port": parsePort(u.Port()),
 		"uuid":        u.User.Username(),
 		"password":    password,
+	}
+	q := u.Query()
+	if sni := strings.TrimSpace(q.Get("sni")); sni != "" {
+		outbound["tls"] = map[string]interface{}{"enabled": true, "server_name": sni}
+	}
+	if alpn := splitCSV(q.Get("alpn")); len(alpn) > 0 {
+		if tls, ok := outbound["tls"].(map[string]interface{}); ok {
+			tls["alpn"] = alpn
+		} else {
+			outbound["tls"] = map[string]interface{}{"enabled": true, "alpn": alpn}
+		}
+	}
+	if cc := strings.TrimSpace(q.Get("congestion_control")); cc != "" {
+		outbound["congestion_control"] = cc
+	}
+	if mode := strings.TrimSpace(q.Get("udp_relay_mode")); mode != "" {
+		outbound["udp_relay_mode"] = mode
 	}
 	if asString(outbound["server"]) == "" || asInt(outbound["server_port"]) <= 0 || asString(outbound["uuid"]) == "" || asString(outbound["password"]) == "" {
 		return nil, errors.New("invalid tuic")
@@ -732,11 +1196,40 @@ func defaultClashProxyGroups(proxyNames []string) []interface{} {
 	}
 }
 
-func ensureClashRules(root map[string]interface{}) {
-	if rules, ok := root["rules"].([]interface{}); ok && len(rules) > 0 {
-		return
+func ensureClashRules(root map[string]interface{}, additionalRules []string) {
+	rules := make([]interface{}, 0)
+	if existing, ok := root["rules"].([]interface{}); ok {
+		rules = append(rules, existing...)
 	}
-	root["rules"] = []interface{}{"MATCH,PROXY"}
+	for _, item := range additionalRules {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			continue
+		}
+		rules = append(rules, trimmed)
+	}
+	if len(rules) == 0 {
+		rules = append(rules, "MATCH,PROXY")
+	}
+	root["rules"] = dedupeRuleInterfaces(rules)
+}
+
+func dedupeRuleInterfaces(rules []interface{}) []interface{} {
+	seen := make(map[string]struct{}, len(rules))
+	result := make([]interface{}, 0, len(rules))
+	for _, item := range rules {
+		rule := strings.TrimSpace(asString(item))
+		if rule == "" {
+			continue
+		}
+		key := strings.ToLower(rule)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, rule)
+	}
+	return result
 }
 
 func uriToClashProxy(line string) (map[string]interface{}, error) {
@@ -754,6 +1247,20 @@ func uriToClashProxy(line string) (map[string]interface{}, error) {
 		return trojanURIToClashProxy(trimmed)
 	case strings.HasPrefix(lower, "ss://"):
 		return ssURIToClashProxy(trimmed)
+	case strings.HasPrefix(lower, "ssr://"):
+		converted, err := ssrURIToSSURI(trimmed)
+		if err != nil {
+			return nil, err
+		}
+		return ssURIToClashProxy(converted)
+	case strings.HasPrefix(lower, "socks5://") || strings.HasPrefix(lower, "socks://"):
+		return socks5URIToClashProxy(trimmed)
+	case strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://"):
+		return httpURIToClashProxy(trimmed)
+	case strings.HasPrefix(lower, "wireguard://") || strings.HasPrefix(lower, "wg://"):
+		return wireguardURIToClashProxy(trimmed)
+	case strings.HasPrefix(lower, "hysteria://") || strings.HasPrefix(lower, "hy://"):
+		return hysteriaURIToClashProxy(trimmed)
 	case strings.HasPrefix(lower, "hysteria2://") || strings.HasPrefix(lower, "hy2://"):
 		return hysteria2URIToClashProxy(trimmed)
 	case strings.HasPrefix(lower, "tuic://"):
@@ -795,11 +1302,28 @@ func vmessURIToClashProxy(line string) (map[string]interface{}, error) {
 	if tls := strings.ToLower(asString(cfg["tls"])); tls == "tls" || tls == "true" {
 		proxy["tls"] = true
 	}
-	if host := asString(cfg["host"]); host != "" {
+	if sni := asString(cfg["sni"]); sni != "" {
+		proxy["servername"] = sni
+	} else if host := asString(cfg["host"]); host != "" {
 		proxy["servername"] = host
 	}
 	if path := asString(cfg["path"]); path != "" {
-		proxy["ws-opts"] = map[string]interface{}{"path": path}
+		if strings.EqualFold(asString(cfg["net"]), "ws") {
+			wsOpts := map[string]interface{}{"path": path}
+			if host := asString(cfg["host"]); host != "" {
+				wsOpts["headers"] = map[string]interface{}{"Host": host}
+			}
+			proxy["ws-opts"] = wsOpts
+		}
+	}
+	if strings.EqualFold(asString(cfg["net"]), "grpc") {
+		serviceName := firstNonEmpty(asString(cfg["serviceName"]), asString(cfg["path"]))
+		if serviceName != "" {
+			proxy["grpc-opts"] = map[string]interface{}{"grpc-service-name": serviceName}
+		}
+	}
+	if fp := asString(cfg["fp"]); fp != "" {
+		proxy["client-fingerprint"] = fp
 	}
 	if asString(proxy["server"]) == "" || asInt(proxy["port"]) <= 0 || asString(proxy["uuid"]) == "" {
 		return nil, errors.New("invalid vmess")
@@ -825,9 +1349,47 @@ func vlessURIToClashProxy(line string) (map[string]interface{}, error) {
 		"port":       parsePort(u.Port()),
 		"uuid":       strings.TrimSpace(u.User.Username()),
 		"network":    fallbackString(q.Get("type"), "tcp"),
-		"tls":        strings.EqualFold(q.Get("security"), "tls"),
+		"tls":        strings.EqualFold(q.Get("security"), "tls") || strings.EqualFold(q.Get("security"), "reality"),
 		"servername": q.Get("sni"),
 		"udp":        true,
+	}
+	if flow := strings.TrimSpace(q.Get("flow")); flow != "" {
+		proxy["flow"] = flow
+	}
+	if fp := strings.TrimSpace(q.Get("fp")); fp != "" {
+		proxy["client-fingerprint"] = fp
+	}
+	if parseBoolString(q.Get("allowInsecure")) {
+		proxy["skip-cert-verify"] = true
+	}
+	if strings.EqualFold(q.Get("security"), "reality") {
+		reality := map[string]interface{}{}
+		if pbk := strings.TrimSpace(q.Get("pbk")); pbk != "" {
+			reality["public-key"] = pbk
+		}
+		if sid := strings.TrimSpace(q.Get("sid")); sid != "" {
+			reality["short-id"] = sid
+		}
+		if len(reality) > 0 {
+			proxy["reality-opts"] = reality
+		}
+	}
+	network := strings.ToLower(strings.TrimSpace(q.Get("type")))
+	if network == "ws" {
+		wsOpts := map[string]interface{}{}
+		if path := strings.TrimSpace(q.Get("path")); path != "" {
+			wsOpts["path"] = path
+		}
+		if host := strings.TrimSpace(q.Get("host")); host != "" {
+			wsOpts["headers"] = map[string]interface{}{"Host": host}
+		}
+		if len(wsOpts) > 0 {
+			proxy["ws-opts"] = wsOpts
+		}
+	} else if network == "grpc" {
+		if serviceName := firstNonEmpty(strings.TrimSpace(q.Get("serviceName")), strings.TrimSpace(q.Get("service_name"))); serviceName != "" {
+			proxy["grpc-opts"] = map[string]interface{}{"grpc-service-name": serviceName}
+		}
 	}
 	if asString(proxy["server"]) == "" || asInt(proxy["port"]) <= 0 || asString(proxy["uuid"]) == "" {
 		return nil, errors.New("invalid vless")
@@ -859,6 +1421,32 @@ func trojanURIToClashProxy(line string) (map[string]interface{}, error) {
 		"sni":        q.Get("sni"),
 		"servername": q.Get("sni"),
 		"udp":        true,
+	}
+	if fp := strings.TrimSpace(q.Get("fp")); fp != "" {
+		proxy["client-fingerprint"] = fp
+	}
+	if parseBoolString(q.Get("allowInsecure")) {
+		proxy["skip-cert-verify"] = true
+	}
+	network := strings.ToLower(strings.TrimSpace(q.Get("type")))
+	if network != "" {
+		proxy["network"] = network
+	}
+	if network == "ws" {
+		wsOpts := map[string]interface{}{}
+		if path := strings.TrimSpace(q.Get("path")); path != "" {
+			wsOpts["path"] = path
+		}
+		if host := strings.TrimSpace(q.Get("host")); host != "" {
+			wsOpts["headers"] = map[string]interface{}{"Host": host}
+		}
+		if len(wsOpts) > 0 {
+			proxy["ws-opts"] = wsOpts
+		}
+	} else if network == "grpc" {
+		if serviceName := firstNonEmpty(strings.TrimSpace(q.Get("serviceName")), strings.TrimSpace(q.Get("service_name"))); serviceName != "" {
+			proxy["grpc-opts"] = map[string]interface{}{"grpc-service-name": serviceName}
+		}
 	}
 	if asString(proxy["server"]) == "" || asInt(proxy["port"]) <= 0 || asString(proxy["password"]) == "" {
 		return nil, errors.New("invalid trojan")
@@ -910,6 +1498,154 @@ func ssURIToClashProxy(line string) (map[string]interface{}, error) {
 	return proxy, nil
 }
 
+func socks5URIToClashProxy(line string) (map[string]interface{}, error) {
+	core, fragment := splitCoreAndFragment(line)
+	u, err := url.Parse(core)
+	if err != nil {
+		return nil, err
+	}
+	name, _ := url.QueryUnescape(fragment)
+	if name == "" {
+		name = "socks5"
+	}
+	proxy := map[string]interface{}{
+		"name":   name,
+		"type":   "socks5",
+		"server": u.Hostname(),
+		"port":   parsePort(u.Port()),
+		"udp":    true,
+	}
+	if u.User != nil {
+		if username := strings.TrimSpace(u.User.Username()); username != "" {
+			proxy["username"] = username
+		}
+		if password, _ := u.User.Password(); strings.TrimSpace(password) != "" {
+			proxy["password"] = password
+		}
+	}
+	if asString(proxy["server"]) == "" || asInt(proxy["port"]) <= 0 {
+		return nil, errors.New("invalid socks5")
+	}
+	return proxy, nil
+}
+
+func httpURIToClashProxy(line string) (map[string]interface{}, error) {
+	core, fragment := splitCoreAndFragment(line)
+	u, err := url.Parse(core)
+	if err != nil {
+		return nil, err
+	}
+	name, _ := url.QueryUnescape(fragment)
+	if name == "" {
+		name = "http"
+	}
+	proxy := map[string]interface{}{
+		"name":   name,
+		"type":   "http",
+		"server": u.Hostname(),
+		"port":   parsePort(u.Port()),
+	}
+	if u.User != nil {
+		if username := strings.TrimSpace(u.User.Username()); username != "" {
+			proxy["username"] = username
+		}
+		if password, _ := u.User.Password(); strings.TrimSpace(password) != "" {
+			proxy["password"] = password
+		}
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		proxy["tls"] = true
+	}
+	if asString(proxy["server"]) == "" || asInt(proxy["port"]) <= 0 {
+		return nil, errors.New("invalid http")
+	}
+	return proxy, nil
+}
+
+func wireguardURIToClashProxy(line string) (map[string]interface{}, error) {
+	core, fragment := splitCoreAndFragment(line)
+	u, err := url.Parse(core)
+	if err != nil {
+		return nil, err
+	}
+	q := u.Query()
+	name, _ := url.QueryUnescape(fragment)
+	if name == "" {
+		name = "wireguard"
+	}
+	privateKey := strings.TrimSpace(q.Get("privatekey"))
+	if privateKey == "" {
+		privateKey = strings.TrimSpace(q.Get("private_key"))
+	}
+	publicKey := strings.TrimSpace(q.Get("publickey"))
+	if publicKey == "" {
+		publicKey = strings.TrimSpace(q.Get("peer_public_key"))
+	}
+	proxy := map[string]interface{}{
+		"name":        name,
+		"type":        "wireguard",
+		"server":      u.Hostname(),
+		"port":        parsePort(u.Port()),
+		"private-key": privateKey,
+		"public-key":  publicKey,
+	}
+	if ip := strings.TrimSpace(q.Get("address")); ip != "" {
+		proxy["ip"] = ip
+	}
+	if reserved := strings.TrimSpace(q.Get("reserved")); reserved != "" {
+		proxy["reserved"] = reserved
+	}
+	if mtu := parsePort(q.Get("mtu")); mtu > 0 {
+		proxy["mtu"] = mtu
+	}
+	if asString(proxy["server"]) == "" || asInt(proxy["port"]) <= 0 || asString(proxy["private-key"]) == "" || asString(proxy["public-key"]) == "" {
+		return nil, errors.New("invalid wireguard")
+	}
+	return proxy, nil
+}
+
+func hysteriaURIToClashProxy(line string) (map[string]interface{}, error) {
+	core, fragment := splitCoreAndFragment(line)
+	u, err := url.Parse(core)
+	if err != nil {
+		return nil, err
+	}
+	q := u.Query()
+	name, _ := url.QueryUnescape(fragment)
+	if name == "" {
+		name = "hysteria"
+	}
+	auth := strings.TrimSpace(q.Get("auth"))
+	if auth == "" {
+		auth = strings.TrimSpace(q.Get("auth_str"))
+	}
+	proxy := map[string]interface{}{
+		"name":   name,
+		"type":   "hysteria",
+		"server": u.Hostname(),
+		"port":   parsePort(u.Port()),
+	}
+	if auth != "" {
+		proxy["auth-str"] = auth
+	}
+	if upMbps := parsePort(q.Get("upmbps")); upMbps > 0 {
+		proxy["up"] = strconv.Itoa(upMbps)
+	}
+	if downMbps := parsePort(q.Get("downmbps")); downMbps > 0 {
+		proxy["down"] = strconv.Itoa(downMbps)
+	}
+	if obfs := strings.TrimSpace(q.Get("obfs")); obfs != "" {
+		proxy["obfs"] = obfs
+	}
+	if sni := strings.TrimSpace(q.Get("sni")); sni != "" {
+		proxy["sni"] = sni
+	}
+	if asString(proxy["server"]) == "" || asInt(proxy["port"]) <= 0 {
+		return nil, errors.New("invalid hysteria")
+	}
+	return proxy, nil
+}
+
 func hysteria2URIToClashProxy(line string) (map[string]interface{}, error) {
 	core, fragment := splitCoreAndFragment(line)
 	u, err := url.Parse(core)
@@ -932,6 +1668,18 @@ func hysteria2URIToClashProxy(line string) (map[string]interface{}, error) {
 		"port":     parsePort(u.Port()),
 		"password": password,
 		"sni":      q.Get("sni"),
+	}
+	if obfs := strings.TrimSpace(q.Get("obfs")); obfs != "" {
+		proxy["obfs"] = obfs
+	}
+	if pwd := firstNonEmpty(strings.TrimSpace(q.Get("obfs-password")), strings.TrimSpace(q.Get("obfs_password"))); pwd != "" {
+		proxy["obfs-password"] = pwd
+	}
+	if alpn := splitCSV(q.Get("alpn")); len(alpn) > 0 {
+		proxy["alpn"] = alpn
+	}
+	if parseBoolString(q.Get("insecure")) || parseBoolString(q.Get("allowInsecure")) {
+		proxy["skip-cert-verify"] = true
 	}
 	if asString(proxy["server"]) == "" || asInt(proxy["port"]) <= 0 || asString(proxy["password"]) == "" {
 		return nil, errors.New("invalid hysteria2")
@@ -957,6 +1705,19 @@ func tuicURIToClashProxy(line string) (map[string]interface{}, error) {
 		"port":     parsePort(u.Port()),
 		"uuid":     u.User.Username(),
 		"password": password,
+	}
+	q := u.Query()
+	if sni := strings.TrimSpace(q.Get("sni")); sni != "" {
+		proxy["sni"] = sni
+	}
+	if alpn := splitCSV(q.Get("alpn")); len(alpn) > 0 {
+		proxy["alpn"] = alpn
+	}
+	if cc := strings.TrimSpace(q.Get("congestion_control")); cc != "" {
+		proxy["congestion-controller"] = cc
+	}
+	if mode := strings.TrimSpace(q.Get("udp_relay_mode")); mode != "" {
+		proxy["udp-relay-mode"] = mode
 	}
 	if asString(proxy["server"]) == "" || asInt(proxy["port"]) <= 0 || asString(proxy["uuid"]) == "" || asString(proxy["password"]) == "" {
 		return nil, errors.New("invalid tuic")
@@ -1105,6 +1866,52 @@ func parseSSRNode(line string) (MergedNode, error) {
 	}, nil
 }
 
+func ssrURIToSSURI(line string) (string, error) {
+	payload := strings.TrimPrefix(strings.TrimSpace(line), "ssr://")
+	decoded, err := decodeBase64Loose(payload)
+	if err != nil {
+		return "", err
+	}
+	raw := string(decoded)
+	mainPart := raw
+	queryPart := ""
+	if idx := strings.Index(raw, "/?"); idx >= 0 {
+		mainPart = raw[:idx]
+		queryPart = raw[idx+2:]
+	}
+	parts := strings.Split(mainPart, ":")
+	if len(parts) < 6 {
+		return "", errors.New("invalid ssr")
+	}
+	host := strings.TrimSpace(parts[0])
+	port := strings.TrimSpace(parts[1])
+	method := strings.TrimSpace(parts[3])
+	passwordEncoded := strings.TrimSpace(parts[5])
+	passwordDecoded, err := decodeBase64Loose(passwordEncoded)
+	if err != nil {
+		return "", err
+	}
+	password := strings.TrimSpace(string(passwordDecoded))
+	if host == "" || port == "" || method == "" || password == "" {
+		return "", errors.New("invalid ssr")
+	}
+	name := ""
+	if queryPart != "" {
+		params, _ := url.ParseQuery(queryPart)
+		if remarks := strings.TrimSpace(params.Get("remarks")); remarks != "" {
+			if text, decErr := decodeBase64Loose(remarks); decErr == nil {
+				name = strings.TrimSpace(string(text))
+			}
+		}
+	}
+	userinfo := base64.StdEncoding.EncodeToString([]byte(method + ":" + password))
+	ss := "ss://" + strings.TrimRight(userinfo, "=") + "@" + host + ":" + port
+	if name != "" {
+		ss += "#" + url.QueryEscape(name)
+	}
+	return ss, nil
+}
+
 func parseURLNode(line string) (MergedNode, error) {
 	core, fragment := splitCoreAndFragment(line)
 	u, err := url.Parse(core)
@@ -1211,10 +2018,23 @@ func clashProxyToURI(proxy map[string]interface{}) string {
 		if tls, ok := proxy["tls"].(bool); ok && tls {
 			cfg["tls"] = "tls"
 		}
+		if sni := asString(proxy["servername"]); sni != "" {
+			cfg["sni"] = sni
+		}
+		if fp := asString(proxy["client-fingerprint"]); fp != "" {
+			cfg["fp"] = fp
+		}
 		if ws, ok := proxy["ws-opts"].(map[string]interface{}); ok {
+			cfg["net"] = "ws"
 			cfg["path"] = asString(ws["path"])
 			if headers, ok := ws["headers"].(map[string]interface{}); ok {
 				cfg["host"] = asString(headers["Host"])
+			}
+		}
+		if grpc, ok := proxy["grpc-opts"].(map[string]interface{}); ok {
+			cfg["net"] = "grpc"
+			if serviceName := asString(grpc["grpc-service-name"]); serviceName != "" {
+				cfg["serviceName"] = serviceName
 			}
 		}
 		buf, err := json.Marshal(cfg)
@@ -1228,8 +2048,45 @@ func clashProxyToURI(proxy map[string]interface{}) string {
 		if network := asString(proxy["network"]); network != "" {
 			q.Set("type", network)
 		}
-		if tls, ok := proxy["tls"].(bool); ok && tls {
+		if ws, ok := proxy["ws-opts"].(map[string]interface{}); ok {
+			q.Set("type", "ws")
+			if path := asString(ws["path"]); path != "" {
+				q.Set("path", path)
+			}
+			if headers, ok := ws["headers"].(map[string]interface{}); ok {
+				if host := asString(headers["Host"]); host != "" {
+					q.Set("host", host)
+				}
+			}
+		}
+		if grpc, ok := proxy["grpc-opts"].(map[string]interface{}); ok {
+			q.Set("type", "grpc")
+			if serviceName := asString(grpc["grpc-service-name"]); serviceName != "" {
+				q.Set("serviceName", serviceName)
+			}
+		}
+		if flow := asString(proxy["flow"]); flow != "" {
+			q.Set("flow", flow)
+		}
+		if fp := asString(proxy["client-fingerprint"]); fp != "" {
+			q.Set("fp", fp)
+		}
+		if parseBoolString(asString(proxy["skip-cert-verify"])) {
+			q.Set("allowInsecure", "1")
+		}
+		if reality, ok := proxy["reality-opts"].(map[string]interface{}); ok {
+			q.Set("security", "reality")
+			if pbk := asString(reality["public-key"]); pbk != "" {
+				q.Set("pbk", pbk)
+			}
+			if sid := asString(reality["short-id"]); sid != "" {
+				q.Set("sid", sid)
+			}
+		} else if tls, ok := proxy["tls"].(bool); ok && tls {
 			q.Set("security", "tls")
+		}
+		if sni := asString(proxy["servername"]); sni != "" {
+			q.Set("sni", sni)
 		}
 		return fmt.Sprintf("vless://%s@%s:%d?%s#%s", url.QueryEscape(asString(proxy["uuid"])), server, port, q.Encode(), url.QueryEscape(name))
 	case "trojan":
@@ -1237,23 +2094,139 @@ func clashProxyToURI(proxy map[string]interface{}) string {
 		if sni := asString(proxy["sni"]); sni != "" {
 			q.Set("sni", sni)
 		}
+		if network := asString(proxy["network"]); network != "" {
+			q.Set("type", network)
+		}
+		if ws, ok := proxy["ws-opts"].(map[string]interface{}); ok {
+			q.Set("type", "ws")
+			if path := asString(ws["path"]); path != "" {
+				q.Set("path", path)
+			}
+			if headers, ok := ws["headers"].(map[string]interface{}); ok {
+				if host := asString(headers["Host"]); host != "" {
+					q.Set("host", host)
+				}
+			}
+		}
+		if grpc, ok := proxy["grpc-opts"].(map[string]interface{}); ok {
+			q.Set("type", "grpc")
+			if serviceName := asString(grpc["grpc-service-name"]); serviceName != "" {
+				q.Set("serviceName", serviceName)
+			}
+		}
+		if fp := asString(proxy["client-fingerprint"]); fp != "" {
+			q.Set("fp", fp)
+		}
+		if parseBoolString(asString(proxy["skip-cert-verify"])) {
+			q.Set("allowInsecure", "1")
+		}
 		return fmt.Sprintf("trojan://%s@%s:%d?%s#%s", url.QueryEscape(asString(proxy["password"])), server, port, q.Encode(), url.QueryEscape(name))
 	case "ss":
 		method := asString(proxy["cipher"])
 		password := asString(proxy["password"])
 		userinfo := base64.StdEncoding.EncodeToString([]byte(method + ":" + password))
 		return fmt.Sprintf("ss://%s@%s:%d#%s", strings.TrimRight(userinfo, "="), server, port, url.QueryEscape(name))
+	case "ssr":
+		method := asString(proxy["cipher"])
+		password := asString(proxy["password"])
+		userinfo := base64.StdEncoding.EncodeToString([]byte(method + ":" + password))
+		return fmt.Sprintf("ss://%s@%s:%d#%s", strings.TrimRight(userinfo, "="), server, port, url.QueryEscape(name))
+	case "socks5", "socks":
+		auth := ""
+		if username := asString(proxy["username"]); username != "" {
+			auth = username
+			if password := asString(proxy["password"]); password != "" {
+				auth += ":" + password
+			}
+			auth += "@"
+		}
+		return fmt.Sprintf("socks5://%s%s:%d#%s", auth, server, port, url.QueryEscape(name))
+	case "http":
+		scheme := "http"
+		if tls, ok := proxy["tls"].(bool); ok && tls {
+			scheme = "https"
+		}
+		auth := ""
+		if username := asString(proxy["username"]); username != "" {
+			auth = username
+			if password := asString(proxy["password"]); password != "" {
+				auth += ":" + password
+			}
+			auth += "@"
+		}
+		return fmt.Sprintf("%s://%s%s:%d#%s", scheme, auth, server, port, url.QueryEscape(name))
+	case "wireguard":
+		q := url.Values{}
+		if privateKey := asString(proxy["private-key"]); privateKey != "" {
+			q.Set("privatekey", privateKey)
+		}
+		if publicKey := asString(proxy["public-key"]); publicKey != "" {
+			q.Set("publickey", publicKey)
+		}
+		if ip := asString(proxy["ip"]); ip != "" {
+			q.Set("address", ip)
+		}
+		if reserved := asString(proxy["reserved"]); reserved != "" {
+			q.Set("reserved", reserved)
+		}
+		if mtu := asInt(proxy["mtu"]); mtu > 0 {
+			q.Set("mtu", strconv.Itoa(mtu))
+		}
+		return fmt.Sprintf("wireguard://%s:%d?%s#%s", server, port, q.Encode(), url.QueryEscape(name))
+	case "hysteria":
+		q := url.Values{}
+		if auth := asString(proxy["auth-str"]); auth != "" {
+			q.Set("auth", auth)
+		}
+		if up := asString(proxy["up"]); up != "" {
+			q.Set("upmbps", up)
+		}
+		if down := asString(proxy["down"]); down != "" {
+			q.Set("downmbps", down)
+		}
+		if obfs := asString(proxy["obfs"]); obfs != "" {
+			q.Set("obfs", obfs)
+		}
+		if sni := asString(proxy["sni"]); sni != "" {
+			q.Set("sni", sni)
+		}
+		return fmt.Sprintf("hysteria://%s:%d?%s#%s", server, port, q.Encode(), url.QueryEscape(name))
 	case "hysteria2", "hy2":
 		password := asString(proxy["password"])
 		q := url.Values{}
 		if sni := asString(proxy["sni"]); sni != "" {
 			q.Set("sni", sni)
 		}
+		if obfs := asString(proxy["obfs"]); obfs != "" {
+			q.Set("obfs", obfs)
+		}
+		if obfsPassword := asString(proxy["obfs-password"]); obfsPassword != "" {
+			q.Set("obfs-password", obfsPassword)
+		}
+		if alpn := anySliceToCSV(proxy["alpn"]); alpn != "" {
+			q.Set("alpn", alpn)
+		}
+		if parseBoolString(asString(proxy["skip-cert-verify"])) {
+			q.Set("insecure", "1")
+		}
 		return fmt.Sprintf("hysteria2://%s@%s:%d?%s#%s", url.QueryEscape(password), server, port, q.Encode(), url.QueryEscape(name))
 	case "tuic":
 		uuid := asString(proxy["uuid"])
 		password := asString(proxy["password"])
-		return fmt.Sprintf("tuic://%s:%s@%s:%d#%s", url.QueryEscape(uuid), url.QueryEscape(password), server, port, url.QueryEscape(name))
+		q := url.Values{}
+		if sni := asString(proxy["sni"]); sni != "" {
+			q.Set("sni", sni)
+		}
+		if alpn := anySliceToCSV(proxy["alpn"]); alpn != "" {
+			q.Set("alpn", alpn)
+		}
+		if cc := asString(proxy["congestion-controller"]); cc != "" {
+			q.Set("congestion_control", cc)
+		}
+		if mode := asString(proxy["udp-relay-mode"]); mode != "" {
+			q.Set("udp_relay_mode", mode)
+		}
+		return fmt.Sprintf("tuic://%s:%s@%s:%d?%s#%s", url.QueryEscape(uuid), url.QueryEscape(password), server, port, q.Encode(), url.QueryEscape(name))
 	default:
 		return ""
 	}
@@ -1283,23 +2256,237 @@ func parseLinesFromSingBoxJSON(raw string) []string {
 		}
 		switch typeName {
 		case "vmess":
-			cfg := map[string]interface{}{"v": "2", "ps": name, "add": server, "port": strconv.Itoa(port), "id": asString(outbound["uuid"]), "aid": "0", "net": "tcp"}
+			cfg := map[string]interface{}{"v": "2", "ps": name, "add": server, "port": strconv.Itoa(port), "id": asString(outbound["uuid"]), "aid": "0", "net": fallbackString(asString(outbound["network"]), "tcp")}
+			cfg["scy"] = fallbackString(asString(outbound["security"]), "auto")
+			if tls, ok := outbound["tls"].(map[string]interface{}); ok {
+				if enabled, ok := tls["enabled"].(bool); ok && enabled {
+					cfg["tls"] = "tls"
+				}
+				if sni := asString(tls["server_name"]); sni != "" {
+					cfg["sni"] = sni
+				}
+			}
+			if transport, ok := outbound["transport"].(map[string]interface{}); ok {
+				if transportType := asString(transport["type"]); transportType != "" {
+					cfg["net"] = transportType
+				}
+				if path := asString(transport["path"]); path != "" {
+					cfg["path"] = path
+				}
+				if headers, ok := transport["headers"].(map[string]interface{}); ok {
+					if host := asString(headers["Host"]); host != "" {
+						cfg["host"] = host
+					}
+				}
+				if serviceName := asString(transport["service_name"]); serviceName != "" {
+					cfg["serviceName"] = serviceName
+				}
+			}
 			buf, err := json.Marshal(cfg)
 			if err != nil {
 				continue
 			}
 			lines = append(lines, "vmess://"+base64.StdEncoding.EncodeToString(buf))
 		case "vless":
-			lines = append(lines, fmt.Sprintf("vless://%s@%s:%d?encryption=none#%s", url.QueryEscape(asString(outbound["uuid"])), server, port, url.QueryEscape(name)))
+			q := url.Values{}
+			q.Set("encryption", "none")
+			if network := asString(outbound["network"]); network != "" {
+				q.Set("type", network)
+			}
+			if flow := asString(outbound["flow"]); flow != "" {
+				q.Set("flow", flow)
+			}
+			if tls, ok := outbound["tls"].(map[string]interface{}); ok {
+				if enabled, ok := tls["enabled"].(bool); ok && enabled {
+					if _, ok := tls["reality"].(map[string]interface{}); ok {
+						q.Set("security", "reality")
+					} else {
+						q.Set("security", "tls")
+					}
+				}
+				if sni := asString(tls["server_name"]); sni != "" {
+					q.Set("sni", sni)
+				}
+				if insecure := parseBoolString(asString(tls["insecure"])); insecure {
+					q.Set("allowInsecure", "1")
+				}
+				if utls, ok := tls["utls"].(map[string]interface{}); ok {
+					if fp := asString(utls["fingerprint"]); fp != "" {
+						q.Set("fp", fp)
+					}
+				}
+				if reality, ok := tls["reality"].(map[string]interface{}); ok {
+					if pbk := asString(reality["public_key"]); pbk != "" {
+						q.Set("pbk", pbk)
+					}
+					if sid := asString(reality["short_id"]); sid != "" {
+						q.Set("sid", sid)
+					}
+					if spider := asString(reality["spider_x"]); spider != "" {
+						q.Set("spx", spider)
+					}
+				}
+			}
+			if transport, ok := outbound["transport"].(map[string]interface{}); ok {
+				if transportType := asString(transport["type"]); transportType != "" {
+					q.Set("type", transportType)
+				}
+				if path := asString(transport["path"]); path != "" {
+					q.Set("path", path)
+				}
+				if headers, ok := transport["headers"].(map[string]interface{}); ok {
+					if host := asString(headers["Host"]); host != "" {
+						q.Set("host", host)
+					}
+				}
+				if serviceName := asString(transport["service_name"]); serviceName != "" {
+					q.Set("serviceName", serviceName)
+				}
+			}
+			lines = append(lines, fmt.Sprintf("vless://%s@%s:%d?%s#%s", url.QueryEscape(asString(outbound["uuid"])), server, port, q.Encode(), url.QueryEscape(name)))
 		case "trojan":
-			lines = append(lines, fmt.Sprintf("trojan://%s@%s:%d#%s", url.QueryEscape(asString(outbound["password"])), server, port, url.QueryEscape(name)))
+			q := url.Values{}
+			if tls, ok := outbound["tls"].(map[string]interface{}); ok {
+				if sni := asString(tls["server_name"]); sni != "" {
+					q.Set("sni", sni)
+				}
+				if insecure := parseBoolString(asString(tls["insecure"])); insecure {
+					q.Set("allowInsecure", "1")
+				}
+				if utls, ok := tls["utls"].(map[string]interface{}); ok {
+					if fp := asString(utls["fingerprint"]); fp != "" {
+						q.Set("fp", fp)
+					}
+				}
+			}
+			if network := asString(outbound["network"]); network != "" {
+				q.Set("type", network)
+			}
+			if transport, ok := outbound["transport"].(map[string]interface{}); ok {
+				if transportType := asString(transport["type"]); transportType != "" {
+					q.Set("type", transportType)
+				}
+				if path := asString(transport["path"]); path != "" {
+					q.Set("path", path)
+				}
+				if headers, ok := transport["headers"].(map[string]interface{}); ok {
+					if host := asString(headers["Host"]); host != "" {
+						q.Set("host", host)
+					}
+				}
+				if serviceName := asString(transport["service_name"]); serviceName != "" {
+					q.Set("serviceName", serviceName)
+				}
+			}
+			if len(q) > 0 {
+				lines = append(lines, fmt.Sprintf("trojan://%s@%s:%d?%s#%s", url.QueryEscape(asString(outbound["password"])), server, port, q.Encode(), url.QueryEscape(name)))
+			} else {
+				lines = append(lines, fmt.Sprintf("trojan://%s@%s:%d#%s", url.QueryEscape(asString(outbound["password"])), server, port, url.QueryEscape(name)))
+			}
 		case "shadowsocks":
 			userinfo := base64.StdEncoding.EncodeToString([]byte(asString(outbound["method"]) + ":" + asString(outbound["password"])))
 			lines = append(lines, fmt.Sprintf("ss://%s@%s:%d#%s", strings.TrimRight(userinfo, "="), server, port, url.QueryEscape(name)))
 		case "hysteria2":
-			lines = append(lines, fmt.Sprintf("hysteria2://%s@%s:%d#%s", url.QueryEscape(asString(outbound["password"])), server, port, url.QueryEscape(name)))
+			q := url.Values{}
+			if tls, ok := outbound["tls"].(map[string]interface{}); ok {
+				if sni := asString(tls["server_name"]); sni != "" {
+					q.Set("sni", sni)
+				}
+				if insecure := parseBoolString(asString(tls["insecure"])); insecure {
+					q.Set("insecure", "1")
+				}
+				if alpn := anySliceToCSV(tls["alpn"]); alpn != "" {
+					q.Set("alpn", alpn)
+				}
+			}
+			if obfs, ok := outbound["obfs"].(map[string]interface{}); ok {
+				if obfsType := asString(obfs["type"]); obfsType != "" {
+					q.Set("obfs", obfsType)
+				}
+				if obfsPwd := asString(obfs["password"]); obfsPwd != "" {
+					q.Set("obfs-password", obfsPwd)
+				}
+			}
+			lines = append(lines, fmt.Sprintf("hysteria2://%s@%s:%d?%s#%s", url.QueryEscape(asString(outbound["password"])), server, port, q.Encode(), url.QueryEscape(name)))
 		case "tuic":
-			lines = append(lines, fmt.Sprintf("tuic://%s:%s@%s:%d#%s", url.QueryEscape(asString(outbound["uuid"])), url.QueryEscape(asString(outbound["password"])), server, port, url.QueryEscape(name)))
+			q := url.Values{}
+			if tls, ok := outbound["tls"].(map[string]interface{}); ok {
+				if sni := asString(tls["server_name"]); sni != "" {
+					q.Set("sni", sni)
+				}
+				if alpn := anySliceToCSV(tls["alpn"]); alpn != "" {
+					q.Set("alpn", alpn)
+				}
+			}
+			if cc := asString(outbound["congestion_control"]); cc != "" {
+				q.Set("congestion_control", cc)
+			}
+			if mode := asString(outbound["udp_relay_mode"]); mode != "" {
+				q.Set("udp_relay_mode", mode)
+			}
+			lines = append(lines, fmt.Sprintf("tuic://%s:%s@%s:%d?%s#%s", url.QueryEscape(asString(outbound["uuid"])), url.QueryEscape(asString(outbound["password"])), server, port, q.Encode(), url.QueryEscape(name)))
+		case "shadowsocksr":
+			userinfo := base64.StdEncoding.EncodeToString([]byte(asString(outbound["method"]) + ":" + asString(outbound["password"])))
+			lines = append(lines, fmt.Sprintf("ss://%s@%s:%d#%s", strings.TrimRight(userinfo, "="), server, port, url.QueryEscape(name)))
+		case "socks":
+			auth := ""
+			if username := asString(outbound["username"]); username != "" {
+				auth = username
+				if password := asString(outbound["password"]); password != "" {
+					auth += ":" + password
+				}
+				auth += "@"
+			}
+			lines = append(lines, fmt.Sprintf("socks5://%s%s:%d#%s", auth, server, port, url.QueryEscape(name)))
+		case "http":
+			scheme := "http"
+			if tls, ok := outbound["tls"].(map[string]interface{}); ok {
+				if enabled, ok := tls["enabled"].(bool); ok && enabled {
+					scheme = "https"
+				}
+			}
+			auth := ""
+			if username := asString(outbound["username"]); username != "" {
+				auth = username
+				if password := asString(outbound["password"]); password != "" {
+					auth += ":" + password
+				}
+				auth += "@"
+			}
+			lines = append(lines, fmt.Sprintf("%s://%s%s:%d#%s", scheme, auth, server, port, url.QueryEscape(name)))
+		case "wireguard":
+			q := url.Values{}
+			if privateKey := asString(outbound["private_key"]); privateKey != "" {
+				q.Set("privatekey", privateKey)
+			}
+			if peerKey := asString(outbound["peer_public_key"]); peerKey != "" {
+				q.Set("publickey", peerKey)
+			}
+			if addrs, ok := outbound["local_address"].([]interface{}); ok && len(addrs) > 0 {
+				parts := make([]string, 0, len(addrs))
+				for _, item := range addrs {
+					value := asString(item)
+					if value != "" {
+						parts = append(parts, value)
+					}
+				}
+				if len(parts) > 0 {
+					q.Set("address", strings.Join(parts, ","))
+				}
+			}
+			lines = append(lines, fmt.Sprintf("wireguard://%s:%d?%s#%s", server, port, q.Encode(), url.QueryEscape(name)))
+		case "hysteria":
+			q := url.Values{}
+			if auth := asString(outbound["auth_str"]); auth != "" {
+				q.Set("auth", auth)
+			}
+			if up := asInt(outbound["up_mbps"]); up > 0 {
+				q.Set("upmbps", strconv.Itoa(up))
+			}
+			if down := asInt(outbound["down_mbps"]); down > 0 {
+				q.Set("downmbps", strconv.Itoa(down))
+			}
+			lines = append(lines, fmt.Sprintf("hysteria://%s:%d?%s#%s", server, port, q.Encode(), url.QueryEscape(name)))
 		}
 	}
 	return lines
@@ -1338,13 +2525,82 @@ func splitCoreAndFragment(raw string) (string, string) {
 func normalizeProtocol(raw string) string {
 	trimmed := strings.ToLower(strings.TrimSpace(raw))
 	switch trimmed {
-	case "hy2", "hysteria", "hysteria2":
+	case "hy2", "hysteria2":
 		return "hysteria2"
+	case "hy", "hysteria":
+		return "hysteria"
 	case "wg", "wireguard":
 		return "wireguard"
+	case "socks", "socks5h":
+		return "socks5"
 	default:
 		return trimmed
 	}
+}
+
+func splitCSV(raw string) []string {
+	parts := strings.Split(strings.TrimSpace(raw), ",")
+	result := make([]string, 0, len(parts))
+	for _, item := range parts {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			continue
+		}
+		result = append(result, trimmed)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func parseBoolString(raw string) bool {
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	switch trimmed {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func anySliceToCSV(value interface{}) string {
+	if value == nil {
+		return ""
+	}
+	if text, ok := value.(string); ok {
+		return strings.TrimSpace(text)
+	}
+	if list, ok := value.([]string); ok {
+		parts := make([]string, 0, len(list))
+		for _, item := range list {
+			trimmed := strings.TrimSpace(item)
+			if trimmed != "" {
+				parts = append(parts, trimmed)
+			}
+		}
+		return strings.Join(parts, ",")
+	}
+	if list, ok := value.([]interface{}); ok {
+		parts := make([]string, 0, len(list))
+		for _, item := range list {
+			trimmed := asString(item)
+			if trimmed != "" {
+				parts = append(parts, trimmed)
+			}
+		}
+		return strings.Join(parts, ",")
+	}
+	return ""
 }
 
 func parsePort(raw string) int {
@@ -1385,7 +2641,7 @@ func matchNameIncludes(name string, includes []string) bool {
 	}
 	nameLower := strings.ToLower(name)
 	for _, item := range includes {
-		if strings.Contains(nameLower, strings.ToLower(strings.TrimSpace(item))) {
+		if matchesNameToken(nameLower, item) {
 			return true
 		}
 	}
@@ -1395,11 +2651,44 @@ func matchNameIncludes(name string, includes []string) bool {
 func matchNameExcludes(name string, excludes []string) bool {
 	nameLower := strings.ToLower(name)
 	for _, item := range excludes {
-		if strings.Contains(nameLower, strings.ToLower(strings.TrimSpace(item))) {
+		if matchesNameToken(nameLower, item) {
 			return true
 		}
 	}
 	return false
+}
+
+func matchesNameToken(nameLower string, token string) bool {
+	trimmed := strings.TrimSpace(token)
+	if trimmed == "" {
+		return false
+	}
+	if pattern, ok := unwrapRegexPattern(trimmed); ok {
+		re, err := regexp.Compile("(?i)" + pattern)
+		if err != nil {
+			return false
+		}
+		return re.MatchString(nameLower)
+	}
+	return strings.Contains(nameLower, strings.ToLower(trimmed))
+}
+
+func unwrapRegexPattern(raw string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "re:") {
+		return strings.TrimSpace(trimmed[3:]), true
+	}
+	if strings.HasPrefix(lower, "regex:") {
+		return strings.TrimSpace(trimmed[6:]), true
+	}
+	if len(trimmed) >= 2 && strings.HasPrefix(trimmed, "/") && strings.HasSuffix(trimmed, "/") {
+		return strings.TrimSpace(trimmed[1 : len(trimmed)-1]), true
+	}
+	if strings.ContainsAny(trimmed, "|()[]{}+*?^$") {
+		return trimmed, true
+	}
+	return "", false
 }
 
 func matchRules(node MergedNode, rules []store.MergeRule) bool {

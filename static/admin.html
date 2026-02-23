@@ -1928,11 +1928,6 @@
                     <div class="form-hint">普通上游必填；M类上游可留空（由来源上游聚合）。</div>
                 </div>
                 <div class="form-group">
-                    <label class="form-label">M类配置（JSON）</label>
-                    <textarea class="input" id="up-merge-config" rows="8" placeholder='{"sources":[{"upstream_id":"xxx","prefix":"JSY|","enabled":true}],"include_name_contains":[],"exclude_name_contains":[],"name_replacements":[{"from":"HKG","to":"HK"}],"rules":[]}'>${escapeHtml(JSON.stringify(data?.merge_config || { sources: [], include_name_contains: [], exclude_name_contains: [], name_replacements: [], rules: [] }, null, 2))}</textarea>
-                    <div class="form-hint">仅M类上游生效。sources 中可配置每个来源上游前缀；支持名称包含/排除、名称替换与扩展规则。</div>
-                </div>
-                <div class="form-group">
                     <label class="form-label">节点状态API（可选）</label>
                     <input type="text" class="input" id="up-node-status-url" value="${escapeHtml(data?.node_status_api_endpoint || '')}" placeholder="https://.../api/v1/user/server/fetch">
                     <div class="form-hint">与上方API共用 Authorization / UA / Host / Origin / Referer / 自定义请求头，仅请求地址不同。</div>
@@ -2001,6 +1996,15 @@
                         <div id="merge-rules-list"></div>
                         <button type="button" class="btn btn-secondary btn-sm mt-4" id="add-merge-rule-btn">+ 添加规则</button>
                         <div class="form-hint">支持字段：name / protocol / host / port。操作：contains/not_contains/eq/ne/prefix/suffix/gt/lt/ge/le。</div>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label flex items-center gap-2">
+                            <input type="checkbox" id="merge-use-json">
+                            使用高级JSON配置（覆盖上方GUI）
+                        </label>
+                        <textarea class="input hidden" id="merge-json-config" rows="8" style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;" placeholder='{"sources":[{"upstream_id":"xxx","prefix":"JSY|","enabled":true}],"include_name_contains":["HK"],"exclude_name_contains":["TEST"],"name_replacements":[{"from":"HKG","to":"HK"}],"rules":[{"field":"name","op":"contains","value":"HK"}]}'></textarea>
+                        <div class="form-hint">保留高级接入能力；勾选后将直接使用JSON内容作为 merge_config。</div>
                     </div>
                 </div>
 
@@ -2116,7 +2120,22 @@ rules:
                 }
 
                 if (payload.type === 'merge') {
-                    payload.merge_config = collectMergeConfigFromForm();
+                    if ($('#merge-use-json')?.checked) {
+                        const mergeJsonText = ($('#merge-json-config')?.value || '').trim();
+                        if (!mergeJsonText) throw new Error('请填写高级JSON配置');
+                        let parsedMerge;
+                        try {
+                            parsedMerge = JSON.parse(mergeJsonText);
+                        } catch (e) {
+                            throw new Error('高级JSON格式错误: ' + e.message);
+                        }
+                        if (!parsedMerge || typeof parsedMerge !== 'object' || Array.isArray(parsedMerge)) {
+                            throw new Error('高级JSON必须是对象');
+                        }
+                        payload.merge_config = parsedMerge;
+                    } else {
+                        payload.merge_config = collectMergeConfigFromForm();
+                    }
                 } else {
                     payload.merge_config = mergeDefaults;
                 }
@@ -2151,6 +2170,16 @@ rules:
             initMergeSourcesList(initialMergeConfig.sources, currentUpstreamID);
             initMergeReplacementsList(initialMergeConfig.name_replacements || []);
             initMergeRulesList(initialMergeConfig.rules || []);
+            const mergeUseJson = $('#merge-use-json');
+            const mergeJsonConfig = $('#merge-json-config');
+            if (mergeJsonConfig) {
+                mergeJsonConfig.value = JSON.stringify(initialMergeConfig, null, 2);
+            }
+            if (mergeUseJson && mergeJsonConfig) {
+                mergeUseJson.onchange = () => {
+                    mergeJsonConfig.classList.toggle('hidden', !mergeUseJson.checked);
+                };
+            }
 
             const typeSelect = $('#up-type');
             const modeSelect = $('#up-content-mode');
@@ -2438,10 +2467,73 @@ rules:
 
                 let html = `
                     <div class="dash-card" style="margin-bottom: 1.5rem;">
+                        <div class="dash-card-header">
+                            <div class="dash-card-title">订阅链接构造器（易用GUI + 高级JSON）</div>
+                        </div>
                         <div class="dash-card-body">
-                            <div style="display: flex; gap: 1rem; align-items: center; flex-wrap: wrap;">
+                            <div style="display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; margin-bottom: 1rem;">
                                 <input type="text" class="input" id="base-url-input" placeholder="输入服务基础URL，如: http://localhost:3000" style="flex: 1; min-width: 250px;">
                                 <button class="btn btn-secondary" id="show-usage-btn">📖 使用说明</button>
+                            </div>
+                            <div style="display:flex; gap:0.7rem; align-items:center; flex-wrap:wrap; margin-bottom:1rem;">
+                                <select class="input" id="sub-preset" style="max-width: 240px;">
+                                    <option value="">选择参数预设</option>
+                                    <option value="clash_common">Clash 常用</option>
+                                    <option value="singbox_common">Sing-box 常用</option>
+                                    <option value="clean_minimal">精简净化</option>
+                                </select>
+                                <button class="btn btn-secondary btn-sm" id="sub-apply-preset-btn">应用预设</button>
+                                <button class="btn btn-secondary btn-sm" id="sub-save-draft-btn">保存草稿</button>
+                                <button class="btn btn-secondary btn-sm" id="sub-load-draft-btn">加载草稿</button>
+                                <button class="btn btn-secondary btn-sm" id="sub-clear-options-btn">清空参数</button>
+                            </div>
+                            <div class="dashboard-grid" style="grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 0.75rem;">
+                                <div class="form-group">
+                                    <label class="form-label">目标格式</label>
+                                    <select class="input" id="sub-target">
+                                        <option value="">默认（跟随上游）</option>
+                                        <option value="v2ray">v2ray</option>
+                                        <option value="clash">clash</option>
+                                        <option value="clash_meta">clash_meta</option>
+                                        <option value="mihomo">mihomo</option>
+                                        <option value="stash">stash</option>
+                                        <option value="surge">surge</option>
+                                        <option value="singbox">singbox</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">规则配置URL（可选）</label>
+                                    <input class="input" id="sub-config-url" placeholder="https://.../acl4ssr.ini">
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">名称包含（逗号/换行）</label>
+                                    <textarea class="input" id="sub-include" rows="2" placeholder="HK,JP"></textarea>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">名称排除（逗号/换行）</label>
+                                    <textarea class="input" id="sub-exclude" rows="2" placeholder="TEST,EXPIRE"></textarea>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">重命名规则</label>
+                                    <textarea class="input" id="sub-rename" rows="2" placeholder="香港@HK, 日本@JP"></textarea>
+                                    <div class="form-hint">每条规则: 原名@新名；多条可用逗号或换行分隔</div>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">功能开关</label>
+                                    <div style="display:flex; gap:0.8rem; flex-wrap:wrap; margin-top:0.3rem;">
+                                        <label class="text-sm"><input type="checkbox" id="sub-emoji"> emoji</label>
+                                        <label class="text-sm"><input type="checkbox" id="sub-sort"> sort</label>
+                                        <label class="text-sm"><input type="checkbox" id="sub-dedupe"> dedupe</label>
+                                        <label class="text-sm"><input type="checkbox" id="sub-list"> list</label>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="form-group" style="margin-top:0.75rem;">
+                                <label class="form-label" style="display:flex; align-items:center; gap:0.45rem;">
+                                    <input type="checkbox" id="sub-use-advanced-json"> 使用高级JSON参数（保留高级接入）
+                                </label>
+                                <textarea class="input hidden" id="sub-advanced-json" rows="6" placeholder='{"target":"clash","include":"HK``JP","exclude":"TEST","rename":"香港@HK``日本@JP","emoji":"true"}' style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;"></textarea>
+                                <div class="form-hint">高级JSON会覆盖上面的GUI参数，可直接粘贴复杂查询参数对象。</div>
                             </div>
                         </div>
                     </div>
@@ -2518,6 +2610,30 @@ rules:
                 if (showUsageBtn) {
                     showUsageBtn.onclick = () => showHelpModal();
                 }
+                const useAdvanced = $('#sub-use-advanced-json');
+                const advancedBox = $('#sub-advanced-json');
+                if (useAdvanced && advancedBox) {
+                    useAdvanced.onchange = () => {
+                        advancedBox.classList.toggle('hidden', !useAdvanced.checked);
+                    };
+                }
+                $('#sub-apply-preset-btn')?.addEventListener('click', () => {
+                    try {
+                        applySubscribePreset($('#sub-preset')?.value || '');
+                    } catch (e) {
+                        showToast(e.message || '应用预设失败', 'error');
+                    }
+                });
+                $('#sub-save-draft-btn')?.addEventListener('click', () => {
+                    saveSubscribeBuilderDraft();
+                });
+                $('#sub-load-draft-btn')?.addEventListener('click', () => {
+                    loadSubscribeBuilderDraft();
+                });
+                $('#sub-clear-options-btn')?.addEventListener('click', () => {
+                    clearSubscribeBuilderOptions();
+                });
+                loadSubscribeBuilderDraft({ silent: true });
             } catch (e) {
                 content.innerHTML = '<div class="text-danger">加载失败: ' + escapeHtml(e.message) + '</div>';
             }
@@ -2875,9 +2991,221 @@ rules:
             return window.location.origin;
         }
 
-        async function copySubscribeLink(key) {
+        const SUB_BUILDER_DRAFT_KEY = 'jsyproxy-sub-builder-draft-v1';
+
+        function subscribePresetMap() {
+            return {
+                clash_common: {
+                    target: 'clash',
+                    include: '',
+                    exclude: 'TEST,EXPIRE',
+                    rename: '',
+                    config: '',
+                    emoji: true,
+                    sort: true,
+                    dedupe: true,
+                    list: false
+                },
+                singbox_common: {
+                    target: 'singbox',
+                    include: '',
+                    exclude: 'TEST,EXPIRE',
+                    rename: '',
+                    config: '',
+                    emoji: false,
+                    sort: true,
+                    dedupe: true,
+                    list: false
+                },
+                clean_minimal: {
+                    target: '',
+                    include: '',
+                    exclude: 'TEST,EXPIRE',
+                    rename: '',
+                    config: '',
+                    emoji: false,
+                    sort: false,
+                    dedupe: true,
+                    list: false
+                }
+            };
+        }
+
+        function collectSubscribeBuilderFormState() {
+            return {
+                target: ($('#sub-target')?.value || '').trim(),
+                config: ($('#sub-config-url')?.value || '').trim(),
+                include: ($('#sub-include')?.value || '').trim(),
+                exclude: ($('#sub-exclude')?.value || '').trim(),
+                rename: ($('#sub-rename')?.value || '').trim(),
+                emoji: !!$('#sub-emoji')?.checked,
+                sort: !!$('#sub-sort')?.checked,
+                dedupe: !!$('#sub-dedupe')?.checked,
+                list: !!$('#sub-list')?.checked,
+                useAdvanced: !!$('#sub-use-advanced-json')?.checked,
+                advancedJSON: ($('#sub-advanced-json')?.value || '').trim(),
+                preset: ($('#sub-preset')?.value || '').trim()
+            };
+        }
+
+        function applySubscribeBuilderFormState(state = {}) {
+            if ($('#sub-target')) $('#sub-target').value = String(state.target || '').trim();
+            if ($('#sub-config-url')) $('#sub-config-url').value = String(state.config || '').trim();
+            if ($('#sub-include')) $('#sub-include').value = String(state.include || '').trim();
+            if ($('#sub-exclude')) $('#sub-exclude').value = String(state.exclude || '').trim();
+            if ($('#sub-rename')) $('#sub-rename').value = String(state.rename || '').trim();
+            if ($('#sub-emoji')) $('#sub-emoji').checked = !!state.emoji;
+            if ($('#sub-sort')) $('#sub-sort').checked = !!state.sort;
+            if ($('#sub-dedupe')) $('#sub-dedupe').checked = !!state.dedupe;
+            if ($('#sub-list')) $('#sub-list').checked = !!state.list;
+            if ($('#sub-preset')) $('#sub-preset').value = String(state.preset || '').trim();
+
+            const useAdvanced = !!state.useAdvanced;
+            if ($('#sub-use-advanced-json')) $('#sub-use-advanced-json').checked = useAdvanced;
+            if ($('#sub-advanced-json')) $('#sub-advanced-json').value = String(state.advancedJSON || '').trim();
+            if ($('#sub-advanced-json')) $('#sub-advanced-json').classList.toggle('hidden', !useAdvanced);
+        }
+
+        function applySubscribePreset(presetKey) {
+            const map = subscribePresetMap();
+            const preset = map[String(presetKey || '').trim()];
+            if (!preset) {
+                throw new Error('请选择有效预设');
+            }
+            applySubscribeBuilderFormState({
+                ...preset,
+                preset: presetKey,
+                useAdvanced: false,
+                advancedJSON: ''
+            });
+            showToast('预设已应用', 'success');
+        }
+
+        function saveSubscribeBuilderDraft() {
+            try {
+                const state = collectSubscribeBuilderFormState();
+                localStorage.setItem(SUB_BUILDER_DRAFT_KEY, JSON.stringify(state));
+                showToast('参数草稿已保存', 'success');
+            } catch (e) {
+                showToast('保存草稿失败', 'error');
+            }
+        }
+
+        function loadSubscribeBuilderDraft(options = {}) {
+            try {
+                const raw = localStorage.getItem(SUB_BUILDER_DRAFT_KEY);
+                if (!raw) {
+                    if (!options.silent) showToast('暂无草稿', 'info');
+                    return;
+                }
+                const state = JSON.parse(raw);
+                if (!state || typeof state !== 'object') {
+                    if (!options.silent) showToast('草稿格式无效', 'error');
+                    return;
+                }
+                applySubscribeBuilderFormState(state);
+                if (!options.silent) showToast('草稿已加载', 'success');
+            } catch (e) {
+                if (!options.silent) showToast('加载草稿失败', 'error');
+            }
+        }
+
+        function clearSubscribeBuilderOptions() {
+            applySubscribeBuilderFormState({
+                target: '',
+                config: '',
+                include: '',
+                exclude: '',
+                rename: '',
+                emoji: false,
+                sort: false,
+                dedupe: false,
+                list: false,
+                useAdvanced: false,
+                advancedJSON: '',
+                preset: ''
+            });
+            showToast('参数已清空', 'success');
+        }
+
+        function parseMultiValueText(raw) {
+            const text = String(raw || '').trim();
+            if (!text) return '';
+            return text
+                .split(/[\n,]+/)
+                .map(v => v.trim())
+                .filter(Boolean)
+                .join('``');
+        }
+
+        function collectSubscribeConvertOptions() {
+            const useAdvanced = !!$('#sub-use-advanced-json')?.checked;
+            if (useAdvanced) {
+                const raw = ($('#sub-advanced-json')?.value || '').trim();
+                if (!raw) return {};
+                let parsed;
+                try {
+                    parsed = JSON.parse(raw);
+                } catch (e) {
+                    throw new Error('高级JSON格式错误: ' + e.message);
+                }
+                if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                    throw new Error('高级JSON必须是对象');
+                }
+                const result = {};
+                Object.entries(parsed).forEach(([key, value]) => {
+                    const k = String(key || '').trim();
+                    if (!k || value === undefined || value === null) return;
+                    if (Array.isArray(value)) {
+                        const arr = value.map(v => String(v || '').trim()).filter(Boolean);
+                        if (arr.length > 0) result[k] = arr.join('``');
+                        return;
+                    }
+                    result[k] = String(value).trim();
+                });
+                return result;
+            }
+
+            const options = {
+                target: ($('#sub-target')?.value || '').trim(),
+                config: ($('#sub-config-url')?.value || '').trim(),
+                include: parseMultiValueText($('#sub-include')?.value || ''),
+                exclude: parseMultiValueText($('#sub-exclude')?.value || ''),
+                rename: parseMultiValueText($('#sub-rename')?.value || ''),
+                emoji: $('#sub-emoji')?.checked ? 'true' : '',
+                sort: $('#sub-sort')?.checked ? 'true' : '',
+                dedupe: $('#sub-dedupe')?.checked ? 'true' : '',
+                list: $('#sub-list')?.checked ? 'true' : ''
+            };
+            const result = {};
+            Object.entries(options).forEach(([key, value]) => {
+                const v = String(value || '').trim();
+                if (v) result[key] = v;
+            });
+            return result;
+        }
+
+        function buildSubscribeLink(key, options = {}) {
             const baseUrl = getBaseUrl();
-            const link = `${baseUrl}/apix/getSubscribe?token=${key}`;
+            const query = new URLSearchParams({ token: key });
+            Object.entries(options || {}).forEach(([k, v]) => {
+                const keyTrim = String(k || '').trim();
+                const valueTrim = String(v || '').trim();
+                if (!keyTrim || !valueTrim) return;
+                query.set(keyTrim, valueTrim);
+            });
+            return `${baseUrl}/apix/getSubscribe?${query.toString()}`;
+        }
+
+        async function copySubscribeLink(key) {
+            let link = '';
+            try {
+                const options = collectSubscribeConvertOptions();
+                link = buildSubscribeLink(key, options);
+            } catch (e) {
+                showToast(e.message || '链接参数解析失败', 'error');
+                return;
+            }
 
             try {
                 await navigator.clipboard.writeText(link);
@@ -2934,6 +3262,9 @@ rules:
                         <div style="background: var(--bg-body); padding: 1rem; border-radius: var(--radius); font-family: monospace; font-size: 0.85rem; word-break: break-all;">
                             ${baseUrl}/apix/getSubscribe?token=<span style="color: var(--primary);">YOUR_KEY</span>
                         </div>
+                        <div style="background: var(--bg-body); padding: 1rem; border-radius: var(--radius); font-family: monospace; font-size: 0.8rem; word-break: break-all; margin-top:0.5rem;">
+                            ${baseUrl}/apix/getSubscribe?token=YOUR_KEY&target=clash&include=HK%60%60JP&exclude=TEST&rename=%E9%A6%99%E6%B8%AF%40HK&emoji=true&sort=true&dedupe=true
+                        </div>
                     </div>
 
                     <div style="margin-bottom: 1rem;">
@@ -2943,6 +3274,7 @@ rules:
                             <li>如果怀疑链接泄露，请及时更换 Key</li>
                             <li>上游缓存会定期自动刷新，无需手动更新订阅</li>
                             <li>每个 Key 绑定一个上游，可以在 Key 管理中查看</li>
+                            <li>可在 Key 页面上方“订阅链接构造器”里可视化拼装转换参数</li>
                         </ul>
                     </div>
                 </div>
@@ -3124,10 +3456,13 @@ rules:
                                 <div class="form-hint">JSON格式的规则数组。每条规则需要 canonical_class, bucket_key, 以及 all_contains 或 any_contains。</div>
                                 <div id="ua-rules-error" class="text-danger text-sm mt-4 hidden"></div>
                                 <input type="file" id="ua-rules-import-file" accept="application/json,.json" class="hidden">
+                                <input type="file" id="global-config-import-file" accept="application/json,.json" class="hidden">
                             </div>
                         </div>
                         <div class="dash-card-footer">
                             <div class="dash-actions">
+                                <button class="btn btn-secondary" id="export-global-btn">导出全局配置</button>
+                                <button class="btn btn-secondary" id="import-global-btn" ${canWriteSettings ? '' : 'disabled'}>导入全局配置</button>
                                 <button class="btn btn-secondary" id="export-rules-btn">导出规则</button>
                                 <button class="btn btn-secondary" id="import-rules-btn" ${canWriteSettings ? '' : 'disabled'}>导入规则</button>
                                 <button class="btn btn-secondary" id="validate-rules-btn" ${canWriteSettings ? '' : 'disabled'}>验证规则</button>
@@ -3137,8 +3472,15 @@ rules:
                     </div>
                 `;
 
+                $('#export-global-btn').onclick = exportGlobalConfig;
                 $('#export-rules-btn').onclick = exportUARules;
                 if (canWriteSettings) {
+                    $('#import-global-btn').onclick = () => {
+                        const fileInput = $('#global-config-import-file');
+                        if (!fileInput) return;
+                        fileInput.value = '';
+                        fileInput.click();
+                    };
                     $('#import-rules-btn').onclick = () => {
                         const fileInput = $('#ua-rules-import-file');
                         if (!fileInput) return;
@@ -3153,6 +3495,15 @@ rules:
                         const file = importInput.files && importInput.files[0];
                         if (!file) return;
                         await importUARulesFromFile(file);
+                    };
+                }
+                const globalImportInput = $('#global-config-import-file');
+                if (globalImportInput) {
+                    globalImportInput.onchange = async () => {
+                        if (!canWriteSettings) return;
+                        const file = globalImportInput.files && globalImportInput.files[0];
+                        if (!file) return;
+                        await importGlobalConfigFromFile(file);
                     };
                 }
 
@@ -3287,6 +3638,69 @@ rules:
                 showToast('规则导出成功', 'success');
             } catch (e) {
                 showToast(e.message || '导出失败', 'error');
+            }
+        }
+
+        async function exportGlobalConfig() {
+            try {
+                const res = await fetch('/admin/api/settings/global/export', {
+                    method: 'GET',
+                    credentials: 'include'
+                });
+                if (!res.ok) {
+                    if (res.status === 401) {
+                        showLogin();
+                        return;
+                    }
+                    let errorText = '导出全局配置失败';
+                    try {
+                        const errData = await res.json();
+                        errorText = errData.error || errorText;
+                    } catch (e) {}
+                    throw new Error(errorText);
+                }
+
+                const blob = await res.blob();
+                const disposition = res.headers.get('Content-Disposition') || '';
+                const match = disposition.match(/filename="?([^";]+)"?/i);
+                const filename = (match && match[1]) ? match[1] : 'global-config-export.json';
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+                showToast('全局配置导出成功', 'success');
+            } catch (e) {
+                showToast(e.message || '导出全局配置失败', 'error');
+            }
+        }
+
+        async function importGlobalConfigFromFile(file) {
+            if (!hasPermission(PERM.SETTINGS_WRITE)) {
+                showToast('当前账号无设置修改权限', 'error');
+                return;
+            }
+            if (!file) return;
+            try {
+                const text = await file.text();
+                const payload = JSON.parse(text);
+                const config = payload && typeof payload === 'object' && payload.global_config
+                    ? payload
+                    : { global_config: payload };
+                if (!config || typeof config !== 'object' || !config.global_config) {
+                    throw new Error('配置文件必须包含 global_config 对象，或直接是全局配置对象');
+                }
+                await api('/settings/global/import', {
+                    method: 'POST',
+                    body: JSON.stringify(config)
+                });
+                showToast('全局配置导入成功', 'success');
+                renderSettings();
+            } catch (e) {
+                showToast(e.message || '导入全局配置失败', 'error');
             }
         }
 

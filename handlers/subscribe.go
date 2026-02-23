@@ -14,6 +14,7 @@ import (
 	"jsyproxy/utils"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -110,6 +111,18 @@ type upstreamRequest struct {
 	Enabled                   bool              `json:"enabled"`
 }
 
+type requestConversionOptions struct {
+	TargetFormat       string
+	ConfigURL          string
+	Includes           []string
+	Excludes           []string
+	RenameRules        []store.MergeNameReplacement
+	EnableEmoji        bool
+	SortNodes          bool
+	DedupeNodes        bool
+	OutputNodeListOnly bool
+}
+
 type globalConfigRequest struct {
 	LogRetentionDays int                         `json:"log_retention_days"`
 	ActiveUADays     int                         `json:"active_ua_days"`
@@ -122,14 +135,29 @@ type uaRulesImportRequest struct {
 	Rules              []store.UANormalizationRule `json:"rules"`
 }
 
+type globalConfigImportRequest struct {
+	GlobalConfig     *globalConfigRequest         `json:"global_config,omitempty"`
+	LogRetentionDays *int                         `json:"log_retention_days,omitempty"`
+	ActiveUADays     *int                         `json:"active_ua_days,omitempty"`
+	UANormalization  *store.UANormalizationConfig `json:"ua_normalization,omitempty"`
+}
+
 type SubscribeHandler struct {
 	config            *config.Config
 	httpClient        *utils.HTTPClient
 	state             *store.State
 	refreshMutex      sync.Map
+	loginMu           sync.Mutex
+	loginAttempts     map[string]loginAttempt
 	nodeStatusMu      sync.RWMutex
 	nodeStatusCache   map[string]nodeStatusCacheEntry
 	nodeStatusRunning map[string]bool
+}
+
+type loginAttempt struct {
+	failed       int
+	blockedUntil time.Time
+	lastFailedAt time.Time
 }
 
 type nodeStatusFetchResponse struct {
@@ -154,6 +182,9 @@ type refreshLockValue struct {
 const (
 	refreshContentionTimeout = 10 * time.Second
 	nodeStatusCacheTTL       = 10 * time.Minute
+	maxLoginFailures         = 5
+	loginBlockDuration       = 5 * time.Minute
+	loginFailureWindow       = 15 * time.Minute
 )
 
 func NewSubscribeHandler(cfg *config.Config) (*SubscribeHandler, error) {
@@ -165,6 +196,7 @@ func NewSubscribeHandler(cfg *config.Config) (*SubscribeHandler, error) {
 		config:            cfg,
 		httpClient:        utils.NewHTTPClient(),
 		state:             state,
+		loginAttempts:     make(map[string]loginAttempt),
 		nodeStatusCache:   make(map[string]nodeStatusCacheEntry),
 		nodeStatusRunning: make(map[string]bool),
 	}, nil
@@ -189,6 +221,10 @@ func (h *SubscribeHandler) StartAutoRefresh() {
 			go h.runUpstreamRefreshLoop(u.ID)
 		}
 	}
+}
+
+func (h *SubscribeHandler) FlushState() error {
+	return h.state.Flush()
 }
 
 func (h *SubscribeHandler) runUpstreamRefreshLoop(upstreamID string) {
@@ -301,6 +337,26 @@ func (h *SubscribeHandler) GetSubscribe(c *gin.Context) {
 		}
 	}
 
+	conversionOptions, hasConversionOptions, conversionErr := parseRequestConversionOptions(c)
+	if conversionErr != nil {
+		h.appendClientLog(keyInfo.ID, keyInfo.Key, keyInfo.Name, keyInfo.UpstreamID, clientIP, clientUA, uaDetails, cacheHit, "failed", conversionErr.Error())
+		c.JSON(http.StatusBadRequest, gin.H{"error": conversionErr.Error()})
+		return
+	}
+	if hasConversionOptions {
+		convertedBody, convertedHeaders, err := h.applyRequestConversion(cache, upstream, conversionOptions)
+		if err != nil {
+			h.appendClientLog(keyInfo.ID, keyInfo.Key, keyInfo.Name, keyInfo.UpstreamID, clientIP, clientUA, uaDetails, cacheHit, "failed", err.Error())
+			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+			return
+		}
+		cache = &store.CachedSubscription{
+			Body:       convertedBody,
+			Headers:    convertedHeaders,
+			StatusCode: cache.StatusCode,
+		}
+	}
+
 	copyHeaders(cache.Headers, c.Writer.Header())
 	c.Status(cache.StatusCode)
 	if _, err := c.Writer.Write(cache.Body); err != nil {
@@ -308,6 +364,434 @@ func (h *SubscribeHandler) GetSubscribe(c *gin.Context) {
 		return
 	}
 	h.appendClientLog(keyInfo.ID, keyInfo.Key, keyInfo.Name, keyInfo.UpstreamID, clientIP, clientUA, uaDetails, cacheHit, "success", "")
+}
+
+func parseRequestConversionOptions(c *gin.Context) (requestConversionOptions, bool, error) {
+	opts := requestConversionOptions{}
+	if raw := strings.TrimSpace(c.Query("target")); raw != "" {
+		format, ok := normalizeRequestTargetFormat(raw)
+		if !ok {
+			return requestConversionOptions{}, false, errors.New("不支持的target参数")
+		}
+		opts.TargetFormat = format
+	}
+	if raw := strings.TrimSpace(c.Query("config")); raw != "" {
+		opts.ConfigURL = raw
+	}
+	if raw := strings.TrimSpace(c.Query("include")); raw != "" {
+		opts.Includes = splitFilterTerms(raw)
+	}
+	excludeRaw := strings.TrimSpace(c.Query("exclude"))
+	if excludeRaw == "" {
+		excludeRaw = strings.TrimSpace(c.Query("wxclude"))
+	}
+	if excludeRaw != "" {
+		opts.Excludes = splitFilterTerms(excludeRaw)
+	}
+	if raw := strings.TrimSpace(c.Query("rename")); raw != "" {
+		opts.RenameRules = parseQueryRenameRules(raw)
+	}
+	if parsed, ok := parseBoolQuery(c.Query("emoji")); ok {
+		opts.EnableEmoji = parsed
+	}
+	if parsed, ok := parseBoolQuery(c.Query("sort")); ok {
+		opts.SortNodes = parsed
+	}
+	if parsed, ok := parseBoolQuery(c.Query("dedupe")); ok {
+		opts.DedupeNodes = parsed
+	}
+	if parsed, ok := parseBoolQuery(c.Query("list")); ok {
+		opts.OutputNodeListOnly = parsed
+	}
+	hasAny := opts.TargetFormat != "" || opts.ConfigURL != "" || len(opts.Includes) > 0 || len(opts.Excludes) > 0 || len(opts.RenameRules) > 0 || opts.EnableEmoji || opts.SortNodes || opts.DedupeNodes || opts.OutputNodeListOnly
+	return opts, hasAny, nil
+}
+
+func normalizeRequestTargetFormat(raw string) (string, bool) {
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	switch trimmed {
+	case store.SubscriptionFormatV2Ray, "mixed":
+		return store.SubscriptionFormatV2Ray, true
+	case store.SubscriptionFormatClash:
+		return store.SubscriptionFormatClash, true
+	case "clash-meta", "clashmeta", "clash.meta", store.SubscriptionFormatClashMeta, "meta":
+		return store.SubscriptionFormatClashMeta, true
+	case store.SubscriptionFormatMihomo:
+		return store.SubscriptionFormatMihomo, true
+	case store.SubscriptionFormatStash:
+		return store.SubscriptionFormatStash, true
+	case store.SubscriptionFormatSurge:
+		return store.SubscriptionFormatSurge, true
+	case "sing-box", store.SubscriptionFormatSingBox:
+		return store.SubscriptionFormatSingBox, true
+	default:
+		return "", false
+	}
+}
+
+func splitFilterTerms(raw string) []string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil
+	}
+	parts := []string{trimmed}
+	if strings.Contains(trimmed, "``") {
+		parts = strings.Split(trimmed, "``")
+	} else if strings.Contains(trimmed, "\n") {
+		parts = strings.Split(trimmed, "\n")
+	}
+	result := make([]string, 0, len(parts))
+	for _, item := range parts {
+		token := strings.TrimSpace(item)
+		if token == "" {
+			continue
+		}
+		result = append(result, token)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func parseQueryRenameRules(raw string) []store.MergeNameReplacement {
+	items := strings.Split(raw, "``")
+	result := make([]store.MergeNameReplacement, 0, len(items))
+	for _, item := range items {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			continue
+		}
+		parts := strings.SplitN(trimmed, "@", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		from := strings.TrimSpace(parts[0])
+		if from == "" {
+			continue
+		}
+		result = append(result, store.MergeNameReplacement{From: from, To: strings.TrimSpace(parts[1])})
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func parseBoolQuery(raw string) (bool, bool) {
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	if trimmed == "" {
+		return false, false
+	}
+	switch trimmed {
+	case "1", "true", "on", "yes", "y":
+		return true, true
+	case "0", "false", "off", "no", "n":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func cloneHeaderMap(src map[string][]string) map[string][]string {
+	if src == nil {
+		return map[string][]string{}
+	}
+	result := make(map[string][]string, len(src))
+	for key, values := range src {
+		result[key] = append([]string(nil), values...)
+	}
+	return result
+}
+
+func (h *SubscribeHandler) applyRequestConversion(cache *store.CachedSubscription, upstream store.Upstream, opts requestConversionOptions) ([]byte, map[string][]string, error) {
+	nodes, err := ParseSubscriptionNodes(cache.Body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("按请求参数转换失败: %w", err)
+	}
+	if len(opts.RenameRules) > 0 {
+		nodes = ApplyNameReplacements(nodes, opts.RenameRules)
+	}
+	if opts.EnableEmoji {
+		nodes = ApplyProtocolEmoji(nodes)
+	}
+	nodes = FilterNodes(nodes, opts.Includes, opts.Excludes, nil)
+	if opts.DedupeNodes {
+		nodes = DedupeMergedNodes(nodes)
+	}
+	if opts.SortNodes {
+		nodes = SortMergedNodesByName(nodes)
+	}
+	if len(nodes) == 0 {
+		return nil, nil, errors.New("过滤后没有可用节点")
+	}
+
+	format := upstream.SubscriptionFormat
+	if format == "" {
+		format = store.SubscriptionFormatV2Ray
+	}
+	if opts.TargetFormat != "" {
+		format = opts.TargetFormat
+	}
+
+	headers := cloneHeaderMap(cache.Headers)
+	if opts.OutputNodeListOnly {
+		plainLines, err := renderPlainNodeList(nodes)
+		if err != nil {
+			return nil, nil, err
+		}
+		setHeaderValues(headers, "Content-Type", []string{"text/plain; charset=utf-8"})
+		deleteHeader(headers, "Content-Transfer-Encoding")
+		return plainLines, headers, nil
+	}
+
+	if format == store.SubscriptionFormatClash || format == store.SubscriptionFormatClashMeta || format == store.SubscriptionFormatMihomo || format == store.SubscriptionFormatStash {
+		additionalRules, err := h.loadRulesFromConfigURL(opts.ConfigURL)
+		if err != nil {
+			return nil, nil, err
+		}
+		body, err := RenderClashSubscription(nodes, cache.Body, upstream.ClashConfig, ClashRenderOptions{AdditionalRules: additionalRules})
+		if err != nil {
+			return nil, nil, err
+		}
+		setHeaderValues(headers, "Content-Type", []string{"text/yaml; charset=utf-8"})
+		deleteHeader(headers, "Content-Transfer-Encoding")
+		return body, headers, nil
+	}
+
+	if format == store.SubscriptionFormatSurge {
+		body, err := RenderSurgeSubscription(nodes)
+		if err != nil {
+			return nil, nil, err
+		}
+		setHeaderValues(headers, "Content-Type", []string{"text/plain; charset=utf-8"})
+		deleteHeader(headers, "Content-Transfer-Encoding")
+		return body, headers, nil
+	}
+
+	if format == store.SubscriptionFormatSingBox {
+		body, err := RenderSingBoxSubscription(nodes, cache.Body)
+		if err != nil {
+			return nil, nil, err
+		}
+		setHeaderValues(headers, "Content-Type", []string{"application/json; charset=utf-8"})
+		deleteHeader(headers, "Content-Transfer-Encoding")
+		return body, headers, nil
+	}
+
+	body, err := RenderStandardV2RaySubscription(nodes)
+	if err != nil {
+		return nil, nil, err
+	}
+	setHeaderValues(headers, "Content-Type", []string{"text/plain; charset=utf-8"})
+	setHeaderValues(headers, "Content-Transfer-Encoding", []string{"base64"})
+	return body, headers, nil
+}
+
+func renderPlainNodeList(nodes []MergedNode) ([]byte, error) {
+	lines := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		line, err := node.render(node.Name)
+		if err != nil {
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		lines = append(lines, trimmed)
+	}
+	if len(lines) == 0 {
+		return nil, errors.New("没有可输出节点")
+	}
+	return []byte(strings.Join(lines, "\n")), nil
+}
+
+func (h *SubscribeHandler) loadRulesFromConfigURL(configURL string) ([]string, error) {
+	trimmed := strings.TrimSpace(configURL)
+	if trimmed == "" {
+		return nil, nil
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return nil, errors.New("config参数不是合法URL")
+	}
+	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return nil, errors.New("config仅支持http/https链接")
+	}
+	rules, err := h.fetchRulesFromConfig(parsed.String(), 0)
+	if err != nil {
+		return nil, err
+	}
+	return dedupeRuleStrings(rules), nil
+}
+
+func (h *SubscribeHandler) fetchRulesFromConfig(configURL string, depth int) ([]string, error) {
+	if depth > 2 {
+		return nil, errors.New("config规则嵌套层级过深")
+	}
+	resp, err := h.httpClient.MakeRequest(http.MethodGet, configURL, map[string]string{})
+	if err != nil {
+		return nil, fmt.Errorf("拉取config失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("拉取config失败: HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取config失败: %w", err)
+	}
+	return h.parseRulesFromConfigBody(configURL, body, depth)
+}
+
+func (h *SubscribeHandler) parseRulesFromConfigBody(baseURL string, body []byte, depth int) ([]string, error) {
+	raw := string(body)
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil
+	}
+	if rules := parseRulesFromProviderYAML(trimmed); len(rules) > 0 {
+		return rules, nil
+	}
+	if strings.Contains(trimmed, "[custom]") || strings.Contains(trimmed, "ruleset=") {
+		return h.parseRulesFromACLINI(baseURL, trimmed)
+	}
+	return parseRulesFromList(trimmed, "PROXY"), nil
+}
+
+func parseRulesFromProviderYAML(raw string) []string {
+	root := parseYAMLMap([]byte(raw))
+	if root == nil {
+		return nil
+	}
+	payload, ok := root["payload"].([]interface{})
+	if !ok {
+		return nil
+	}
+	rules := make([]string, 0, len(payload))
+	for _, item := range payload {
+		rule := appendPolicyToRule(asString(item), "PROXY")
+		if rule == "" {
+			continue
+		}
+		rules = append(rules, rule)
+	}
+	return rules
+}
+
+func (h *SubscribeHandler) parseRulesFromACLINI(baseURL, raw string) ([]string, error) {
+	lines := strings.Split(raw, "\n")
+	rules := make([]string, 0, len(lines)*2)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
+			continue
+		}
+		if !strings.HasPrefix(strings.ToLower(trimmed), "ruleset=") {
+			continue
+		}
+		value := strings.TrimSpace(trimmed[len("ruleset="):])
+		if value == "" {
+			continue
+		}
+		parts := strings.SplitN(value, ",", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		policy := strings.TrimSpace(parts[0])
+		source := strings.TrimSpace(parts[1])
+		if policy == "" || source == "" {
+			continue
+		}
+		if strings.HasPrefix(source, "[]") {
+			rule := appendPolicyToRule(strings.TrimSpace(source[2:]), policy)
+			if rule != "" {
+				rules = append(rules, rule)
+			}
+			continue
+		}
+		sourceURL := source
+		if !strings.HasPrefix(strings.ToLower(sourceURL), "http://") && !strings.HasPrefix(strings.ToLower(sourceURL), "https://") {
+			if base, err := url.Parse(baseURL); err == nil {
+				if ref, err := url.Parse(sourceURL); err == nil {
+					sourceURL = base.ResolveReference(ref).String()
+				}
+			}
+		}
+		resp, err := h.httpClient.MakeRequest(http.MethodGet, sourceURL, map[string]string{})
+		if err != nil {
+			continue
+		}
+		content, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil || resp.StatusCode != http.StatusOK {
+			continue
+		}
+		rules = append(rules, parseRulesFromList(string(content), policy)...)
+	}
+	return rules, nil
+}
+
+func parseRulesFromList(raw string, policy string) []string {
+	lines := strings.Split(raw, "\n")
+	rules := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
+			continue
+		}
+		rule := appendPolicyToRule(trimmed, policy)
+		if rule == "" {
+			continue
+		}
+		rules = append(rules, rule)
+	}
+	return rules
+}
+
+func appendPolicyToRule(rule string, policy string) string {
+	trimmed := strings.TrimSpace(rule)
+	if trimmed == "" {
+		return ""
+	}
+	parts := strings.Split(trimmed, ",")
+	if len(parts) == 1 {
+		return ""
+	}
+	normalizedPolicy := strings.TrimSpace(policy)
+	if normalizedPolicy == "" {
+		normalizedPolicy = "PROXY"
+	}
+	if len(parts) == 2 {
+		return trimmed + "," + normalizedPolicy
+	}
+	last := strings.ToLower(strings.TrimSpace(parts[len(parts)-1]))
+	if last == "no-resolve" {
+		if len(parts) == 3 {
+			return strings.Join([]string{strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), normalizedPolicy, strings.TrimSpace(parts[2])}, ",")
+		}
+		return trimmed
+	}
+	return trimmed
+}
+
+func dedupeRuleStrings(rules []string) []string {
+	seen := make(map[string]struct{}, len(rules))
+	result := make([]string, 0, len(rules))
+	for _, rule := range rules {
+		trimmed := strings.TrimSpace(rule)
+		if trimmed == "" {
+			continue
+		}
+		key := strings.ToLower(trimmed)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, trimmed)
+	}
+	return result
 }
 
 func (h *SubscribeHandler) RefreshUpstreamCache(upstreamID, reason, downstreamUA string) error {
@@ -628,6 +1112,12 @@ func (h *SubscribeHandler) AdminPage(c *gin.Context) {
 }
 
 func (h *SubscribeHandler) AdminLogin(c *gin.Context) {
+	clientIP := c.ClientIP()
+	if allowed, retryAfter := h.allowAdminLogin(clientIP); !allowed {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": fmt.Sprintf("登录失败次数过多，请在 %d 秒后重试", retryAfter)})
+		return
+	}
+
 	var req loginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
@@ -639,7 +1129,8 @@ func (h *SubscribeHandler) AdminLogin(c *gin.Context) {
 	}
 	user, err := h.state.AuthenticateAdminUser(username, req.Password)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		h.recordAdminLoginFailure(clientIP)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误"})
 		return
 	}
 	token, err := h.state.CreateAdminSession(user.ID)
@@ -647,7 +1138,9 @@ func (h *SubscribeHandler) AdminLogin(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建会话失败"})
 		return
 	}
-	c.SetCookie("admin_session", token, 86400, "/admin", "", false, true)
+	h.recordAdminLoginSuccess(clientIP)
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie("admin_session", token, 86400, "/admin", "", h.shouldUseSecureCookie(c), true)
 	effectivePermissions := h.state.EffectivePermissions(user.ID)
 	scopeMode := user.UpstreamScopeMode
 	if strings.TrimSpace(scopeMode) == "" {
@@ -668,7 +1161,8 @@ func (h *SubscribeHandler) AdminLogout(c *gin.Context) {
 	if token, err := c.Cookie("admin_session"); err == nil {
 		h.state.DeleteAdminSession(token)
 	}
-	c.SetCookie("admin_session", "", -1, "/admin", "", false, true)
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie("admin_session", "", -1, "/admin", "", h.shouldUseSecureCookie(c), true)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -1068,6 +1562,61 @@ func (h *SubscribeHandler) AdminImportUARules(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ok":       true,
 		"imported": len(uaConfig.Rules),
+	})
+}
+
+func (h *SubscribeHandler) AdminExportGlobalConfig(c *gin.Context) {
+	global := h.state.GetGlobalConfig()
+	fileName := fmt.Sprintf("global-config-%s.json", time.Now().Format("20060102-150405"))
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fileName))
+	c.JSON(http.StatusOK, gin.H{
+		"global_config": global,
+	})
+}
+
+func (h *SubscribeHandler) AdminImportGlobalConfig(c *gin.Context) {
+	var req globalConfigImportRequest
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
+		return
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "配置文件格式错误"})
+		return
+	}
+
+	var target store.GlobalConfig
+	if req.GlobalConfig != nil {
+		target = store.GlobalConfig{
+			LogRetentionDays: req.GlobalConfig.LogRetentionDays,
+			ActiveUADays:     req.GlobalConfig.ActiveUADays,
+			UANormalization:  req.GlobalConfig.UANormalization,
+		}
+	} else {
+		current := h.state.GetGlobalConfig()
+		target = current
+		if req.LogRetentionDays != nil {
+			target.LogRetentionDays = *req.LogRetentionDays
+		}
+		if req.ActiveUADays != nil {
+			target.ActiveUADays = *req.ActiveUADays
+		}
+		if req.UANormalization != nil {
+			target.UANormalization = *req.UANormalization
+		}
+	}
+
+	if err := h.state.UpdateGlobalConfig(target); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":            true,
+		"global_config": h.state.GetGlobalConfig(),
 	})
 }
 
@@ -1514,11 +2063,11 @@ func (h *SubscribeHandler) AdminManualRefresh(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "refreshed": refreshed})
 }
 
-func (h *SubscribeHandler) appendClientLog(keyID, keyToken, keyName, upstreamID, clientIP, userAgent string, uaDetails store.UAMatchDetails, cacheHit bool, status, message string) {
+func (h *SubscribeHandler) appendClientLog(keyID, _ string, keyName, upstreamID, clientIP, userAgent string, uaDetails store.UAMatchDetails, cacheHit bool, status, message string) {
 	entry := store.ClientUpdateLog{
 		Time:        time.Now(),
 		KeyID:       keyID,
-		Key:         keyToken,
+		Key:         "",
 		KeyName:     keyName,
 		UpstreamID:  upstreamID,
 		ClientIP:    clientIP,
@@ -1534,6 +2083,75 @@ func (h *SubscribeHandler) appendClientLog(keyID, keyToken, keyName, upstreamID,
 	if err := h.state.AppendClientLog(entry); err != nil {
 		log.Printf("写入客户端日志失败: %v", err)
 	}
+}
+
+func (h *SubscribeHandler) shouldUseSecureCookie(c *gin.Context) bool {
+	if c.Request != nil && c.Request.TLS != nil {
+		return true
+	}
+	proto := strings.ToLower(strings.TrimSpace(c.GetHeader("X-Forwarded-Proto")))
+	return proto == "https"
+}
+
+func (h *SubscribeHandler) allowAdminLogin(clientIP string) (bool, int) {
+	h.loginMu.Lock()
+	defer h.loginMu.Unlock()
+
+	if strings.TrimSpace(clientIP) == "" {
+		return true, 0
+	}
+
+	attempt, ok := h.loginAttempts[clientIP]
+	if !ok {
+		return true, 0
+	}
+
+	now := time.Now()
+	if now.After(attempt.blockedUntil) {
+		if now.Sub(attempt.lastFailedAt) > loginFailureWindow {
+			delete(h.loginAttempts, clientIP)
+			return true, 0
+		}
+		return true, 0
+	}
+
+	retryAfter := int(attempt.blockedUntil.Sub(now).Seconds())
+	if retryAfter < 1 {
+		retryAfter = 1
+	}
+	return false, retryAfter
+}
+
+func (h *SubscribeHandler) recordAdminLoginFailure(clientIP string) {
+	h.loginMu.Lock()
+	defer h.loginMu.Unlock()
+
+	if strings.TrimSpace(clientIP) == "" {
+		return
+	}
+
+	now := time.Now()
+	attempt := h.loginAttempts[clientIP]
+	if now.Sub(attempt.lastFailedAt) > loginFailureWindow {
+		attempt.failed = 0
+		attempt.blockedUntil = time.Time{}
+	}
+	attempt.failed++
+	attempt.lastFailedAt = now
+	if attempt.failed >= maxLoginFailures {
+		attempt.blockedUntil = now.Add(loginBlockDuration)
+		attempt.failed = 0
+	}
+	h.loginAttempts[clientIP] = attempt
+}
+
+func (h *SubscribeHandler) recordAdminLoginSuccess(clientIP string) {
+	h.loginMu.Lock()
+	defer h.loginMu.Unlock()
+	if strings.TrimSpace(clientIP) == "" {
+		return
+	}
+	delete(h.loginAttempts, clientIP)
 }
 
 func copyHeaders(src map[string][]string, dst http.Header) {

@@ -56,6 +56,8 @@ const (
 	PermissionUserManage        = "user.manage"
 	UpstreamScopeModeAll        = "all"
 	UpstreamScopeModeSelected   = "selected"
+	logPersistEvery             = 50
+	logPersistMaxDelay          = 5 * time.Second
 )
 
 type Upstream struct {
@@ -236,6 +238,8 @@ type State struct {
 	adminUsers      map[string]AdminUser
 	adminUserByName map[string]string
 	adminSessions   map[string]AdminSession
+	logsDirty       bool
+	lastLogPersist  time.Time
 	dataFile        string
 }
 
@@ -250,6 +254,7 @@ func New(dataFile string, initialKeys []string, defaultRefreshInterval, adminUse
 		adminUsers:      make(map[string]AdminUser),
 		adminUserByName: make(map[string]string),
 		adminSessions:   make(map[string]AdminSession),
+		lastLogPersist:  time.Now(),
 		dataFile:        dataFile,
 		config:          GlobalConfig{ActiveUADays: defaultActiveUADays, UANormalization: defaultUANormalizationConfig()},
 	}
@@ -1580,7 +1585,21 @@ func (s *State) AppendClientLog(entry ClientUpdateLog) error {
 	s.logs = append(s.logs, entry)
 
 	s.cleanupLogsLocked()
+	s.logsDirty = true
 
+	if len(s.logs)%logPersistEvery == 0 || time.Since(s.lastLogPersist) >= logPersistMaxDelay {
+		return s.saveLocked()
+	}
+
+	return nil
+}
+
+func (s *State) Flush() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.logsDirty {
+		return nil
+	}
 	return s.saveLocked()
 }
 
@@ -2078,7 +2097,43 @@ func (s *State) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.dataFile, data, 0o600)
+
+	dir := filepath.Dir(s.dataFile)
+	tmpFile, err := os.CreateTemp(dir, filepath.Base(s.dataFile)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpFilePath := tmpFile.Name()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFilePath)
+		return err
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFilePath)
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpFilePath)
+		return err
+	}
+
+	if err := os.Rename(tmpFilePath, s.dataFile); err != nil {
+		if removeErr := os.Remove(s.dataFile); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			_ = os.Remove(tmpFilePath)
+			return fmt.Errorf("替换状态文件失败: %w", err)
+		}
+		if errRetry := os.Rename(tmpFilePath, s.dataFile); errRetry != nil {
+			_ = os.Remove(tmpFilePath)
+			return fmt.Errorf("状态文件原子写入失败: %w", errRetry)
+		}
+	}
+
+	s.logsDirty = false
+	s.lastLogPersist = time.Now()
+	return nil
 }
 
 func cloneCache(src *CachedSubscription) *CachedSubscription {

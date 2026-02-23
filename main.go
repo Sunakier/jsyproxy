@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
 	"jsyproxy/config"
 	"jsyproxy/handlers"
 	"jsyproxy/middleware"
 	"jsyproxy/store"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -46,6 +51,8 @@ func main() {
 		adminAPI.GET("/cache-status", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionUpstreamRead), subscribeHandler.AdminCacheStatus)
 		adminAPI.GET("/settings", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionAdminRead), subscribeHandler.AdminGetSettings)
 		adminAPI.PUT("/settings", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionSettingsWrite), subscribeHandler.AdminUpdateSettings)
+		adminAPI.GET("/settings/global/export", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionAdminRead), subscribeHandler.AdminExportGlobalConfig)
+		adminAPI.POST("/settings/global/import", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionSettingsWrite), subscribeHandler.AdminImportGlobalConfig)
 		adminAPI.GET("/settings/ua-rules/export", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionAdminRead), subscribeHandler.AdminExportUARules)
 		adminAPI.POST("/settings/ua-rules/import", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionSettingsWrite), subscribeHandler.AdminImportUARules)
 		adminAPI.POST("/refresh", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionAdminWrite), subscribeHandler.AdminManualRefresh)
@@ -81,8 +88,39 @@ func main() {
 		})
 	})
 
-	// 启动服务器
-	if err := router.Run(":" + cfg.Port); err != nil {
+	srv := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           router,
+		ReadTimeout:       15 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serverErr <- err
+		}
+	}()
+
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	select {
+	case err := <-serverErr:
 		log.Fatalf("启动服务器失败: %v", err)
+	case <-sigCtx.Done():
+		log.Printf("收到停止信号，开始优雅停机")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("优雅停机失败: %v", err)
+	}
+
+	if err := subscribeHandler.FlushState(); err != nil {
+		log.Printf("停机前刷新状态失败: %v", err)
 	}
 }
