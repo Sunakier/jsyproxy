@@ -2532,7 +2532,7 @@ rules:
                                 <label class="form-label" style="display:flex; align-items:center; gap:0.45rem;">
                                     <input type="checkbox" id="sub-use-advanced-json"> 使用高级JSON参数（保留高级接入）
                                 </label>
-                                <textarea class="input hidden" id="sub-advanced-json" rows="6" placeholder='{"target":"clash","include":"HK``JP","exclude":"TEST","rename":"香港@HK``日本@JP","emoji":"true"}' style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;"></textarea>
+                                <textarea class="input hidden" id="sub-advanced-json" rows="6" placeholder='{"target":"clash","include":"HK\`\`JP","exclude":"TEST","rename":"香港@HK\`\`日本@JP","emoji":"true"}' style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;"></textarea>
                                 <div class="form-hint">高级JSON会覆盖上面的GUI参数，可直接粘贴复杂查询参数对象。</div>
                             </div>
                         </div>
@@ -3422,7 +3422,10 @@ rules:
                 content.innerHTML = `
                     <div class="dash-card">
                         <div class="dash-card-header">
-                            <div class="dash-card-title">Global Configuration</div>
+                            <div class="dash-card-title">全局设置 (存储于数据库)</div>
+                        </div>
+                        <div class="dash-card-body text-sm text-muted" style="padding-bottom: 0;">
+                            说明：以下配置项实时保存在数据库 (如 data/state.json) 中，修改后无需重启服务即时生效。它们独立于服务启动的环境变量或 config.yaml 静态配置。
                         </div>
                         <div class="dash-card-body">
                             <div class="form-group">
