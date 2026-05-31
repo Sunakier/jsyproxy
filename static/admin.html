@@ -693,6 +693,12 @@
             return 'dashboard';
         }
 
+        function getViewFromHash() {
+            const hash = location.hash.replace(/^#\/?/, '');
+            const validViews = ['dashboard', 'nodes', 'cache', 'upstreams', 'keys', 'users', 'logs', 'settings'];
+            return validViews.includes(hash) ? hash : '';
+        }
+
         function syncCurrentUserMeta() {
             const el = $('#current-user-meta');
             if (!el) return;
@@ -747,12 +753,15 @@
             state.permissions = new Set();
             syncCurrentUserMeta();
             applyNavigationPermissions();
+            history.replaceState(null, '', '#/login');
         }
 
         function showApp() {
             $('#login-view').classList.add('hidden');
             $('#app-view').classList.remove('hidden');
-            navigate(firstAllowedView());
+            const hashView = getViewFromHash();
+            const targetView = (hashView && canView(hashView)) ? hashView : firstAllowedView();
+            navigate(targetView);
         }
 
         function clearNodeStatusAutoTimers() {
@@ -766,13 +775,16 @@
             state.nodeStatusAutoTimers = [];
         }
 
-        function navigate(view) {
+        function navigate(view, skipHashUpdate) {
             if (!canView(view)) {
                 showToast('当前账号无权访问该页面', 'error');
                 view = firstAllowedView();
             }
             clearNodeStatusAutoTimers();
             state.view = view;
+            if (!skipHashUpdate) {
+                history.replaceState(null, '', '#/' + view);
+            }
             $$('.nav-item[data-view]').forEach(n => {
                 n.classList.toggle('active', n.dataset.view === view);
             });
@@ -3848,6 +3860,13 @@ rules:
             const menuBtn = $('#menu-toggle');
             if (window.innerWidth <= 768) menuBtn.style.display = 'block';
             menuBtn.onclick = () => $('#sidebar').classList.toggle('open');
+
+            window.addEventListener('hashchange', () => {
+                const view = getViewFromHash();
+                if (view && view !== state.view && canView(view)) {
+                    navigate(view, true);
+                }
+            });
 
             checkSession();
         }
