@@ -149,13 +149,47 @@ func ApplyProtocolEmoji(nodes []MergedNode) []MergedNode {
 	return nodes
 }
 
-func FilterNodes(nodes []MergedNode, includes, excludes []string, rules []store.MergeRule) []MergedNode {
-	result := make([]MergedNode, 0, len(nodes))
-	for _, node := range nodes {
-		if !matchNameIncludes(node.Name, includes) {
+type compiledFilter struct {
+	literal string
+	re      *regexp.Regexp
+}
+
+func compileFilters(tokens []string) []compiledFilter {
+	result := make([]compiledFilter, 0, len(tokens))
+	for _, token := range tokens {
+		trimmed := strings.TrimSpace(token)
+		if trimmed == "" {
 			continue
 		}
-		if matchNameExcludes(node.Name, excludes) {
+		if pattern, ok := unwrapRegexPattern(trimmed); ok {
+			re, err := regexp.Compile("(?i)" + pattern)
+			if err != nil {
+				continue
+			}
+			result = append(result, compiledFilter{re: re})
+		} else {
+			result = append(result, compiledFilter{literal: strings.ToLower(trimmed)})
+		}
+	}
+	return result
+}
+
+func matchesCompiledFilter(nameLower string, filter compiledFilter) bool {
+	if filter.re != nil {
+		return filter.re.MatchString(nameLower)
+	}
+	return strings.Contains(nameLower, filter.literal)
+}
+
+func FilterNodes(nodes []MergedNode, includes, excludes []string, rules []store.MergeRule) []MergedNode {
+	compiledIncludes := compileFilters(includes)
+	compiledExcludes := compileFilters(excludes)
+	result := make([]MergedNode, 0, len(nodes))
+	for _, node := range nodes {
+		if !matchCompiledIncludes(node.Name, compiledIncludes) {
+			continue
+		}
+		if matchCompiledExcludes(node.Name, compiledExcludes) {
 			continue
 		}
 		if !matchRules(node, rules) {
@@ -164,6 +198,32 @@ func FilterNodes(nodes []MergedNode, includes, excludes []string, rules []store.
 		result = append(result, node)
 	}
 	return result
+}
+
+func matchCompiledIncludes(name string, filters []compiledFilter) bool {
+	if len(filters) == 0 {
+		return true
+	}
+	nameLower := strings.ToLower(name)
+	for _, f := range filters {
+		if matchesCompiledFilter(nameLower, f) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchCompiledExcludes(name string, filters []compiledFilter) bool {
+	if len(filters) == 0 {
+		return false
+	}
+	nameLower := strings.ToLower(name)
+	for _, f := range filters {
+		if matchesCompiledFilter(nameLower, f) {
+			return true
+		}
+	}
+	return false
 }
 
 func RenderStandardV2RaySubscription(nodes []MergedNode) ([]byte, error) {
@@ -2676,19 +2736,21 @@ func matchesNameToken(nameLower string, token string) bool {
 func unwrapRegexPattern(raw string) (string, bool) {
 	trimmed := strings.TrimSpace(raw)
 	lower := strings.ToLower(trimmed)
-	if strings.HasPrefix(lower, "re:") {
-		return strings.TrimSpace(trimmed[3:]), true
+	var pattern string
+	switch {
+	case strings.HasPrefix(lower, "re:"):
+		pattern = strings.TrimSpace(trimmed[3:])
+	case strings.HasPrefix(lower, "regex:"):
+		pattern = strings.TrimSpace(trimmed[6:])
+	case len(trimmed) >= 2 && strings.HasPrefix(trimmed, "/") && strings.HasSuffix(trimmed, "/"):
+		pattern = strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+	default:
+		return "", false
 	}
-	if strings.HasPrefix(lower, "regex:") {
-		return strings.TrimSpace(trimmed[6:]), true
+	if pattern == "" || len(pattern) > 200 {
+		return "", false
 	}
-	if len(trimmed) >= 2 && strings.HasPrefix(trimmed, "/") && strings.HasSuffix(trimmed, "/") {
-		return strings.TrimSpace(trimmed[1 : len(trimmed)-1]), true
-	}
-	if strings.ContainsAny(trimmed, "|()[]{}+*?^$") {
-		return trimmed, true
-	}
-	return "", false
+	return pattern, true
 }
 
 func matchRules(node MergedNode, rules []store.MergeRule) bool {

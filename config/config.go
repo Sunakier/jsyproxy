@@ -14,6 +14,7 @@ type Config struct {
 	AdminPassword          string
 	DataFile               string
 	DefaultRefreshInterval string
+	AllowPrivateUpstreams  bool
 	BootstrapAccessKeys    []string
 }
 
@@ -27,6 +28,7 @@ func Load() *Config {
 		AdminPassword:          getEnv("ADMIN_PASSWORD", ""),
 		DataFile:               getEnv("DATA_FILE", "data/state.json"),
 		DefaultRefreshInterval: getEnv("DEFAULT_REFRESH_INTERVAL", "10m"),
+		AllowPrivateUpstreams:  parseBool(getEnv("ALLOW_PRIVATE_UPSTREAMS", "false")),
 	}
 	config.BootstrapAccessKeys = parseCSV(getEnv("ACCESS_KEYS", ""))
 
@@ -61,4 +63,8 @@ func parseCSV(raw string) []string {
 		result = append(result, trimmed)
 	}
 	return result
+}
+
+func parseBool(raw string) bool {
+	return strings.EqualFold(strings.TrimSpace(raw), "true")
 }

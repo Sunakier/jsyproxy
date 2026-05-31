@@ -12,31 +12,6 @@ const (
 	ContextAdminRole     = "admin_role"
 )
 
-// TokenAuth 创建Token鉴权中间件
-func TokenAuth(validToken string) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		token := c.Query("token")
-
-		if token == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": "缺少token参数",
-			})
-			c.Abort()
-			return
-		}
-
-		if token != validToken {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": "无效的token",
-			})
-			c.Abort()
-			return
-		}
-
-		c.Next()
-	}
-}
-
 // AdminAuth 创建后台登录鉴权中间件
 func AdminAuth(
 	validateSession func(string) (string, string, string, bool),
@@ -58,6 +33,18 @@ func AdminAuth(
 			})
 			c.Abort()
 			return
+		}
+
+		// CSRF protection: mutating requests must include X-Requested-With header
+		method := c.Request.Method
+		if method == "POST" || method == "PUT" || method == "DELETE" || method == "PATCH" {
+			if c.GetHeader("X-Requested-With") == "" {
+				c.JSON(http.StatusForbidden, gin.H{
+					"error": "缺少安全请求头",
+				})
+				c.Abort()
+				return
+			}
 		}
 
 		for _, permission := range requiredPermissions {

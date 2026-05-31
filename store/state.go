@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -41,7 +42,7 @@ const (
 	cacheVariantUnknown         = "__unknown__"
 	maxTrackedUAVariants        = 100
 	maxCacheVariantsPerUpstream = maxTrackedUAVariants + 1
-	defaultActiveUADays         = 30
+	defaultActiveUADays         = 7
 	AdminRoleSuperAdmin         = "super_admin"
 	AdminRoleOperator           = "operator"
 	AdminRoleViewer             = "viewer"
@@ -191,6 +192,8 @@ type UACacheStatus struct {
 	HasCache       bool       `json:"has_cache"`
 	CacheUpdatedAt *time.Time `json:"cache_updated_at,omitempty"`
 	LastSeenAt     *time.Time `json:"last_seen_at,omitempty"`
+	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
+	IsExpiringSoon bool       `json:"is_expiring_soon,omitempty"`
 	TotalRequests  int        `json:"total_requests"`
 	TodayRequests  int        `json:"today_requests"`
 	MonthRequests  int        `json:"month_requests"`
@@ -228,6 +231,7 @@ type persistedState struct {
 
 type State struct {
 	mu              sync.RWMutex
+	persistMu       sync.Mutex
 	upstreams       map[string]Upstream
 	keys            map[string]AccessKey
 	keysByToken     map[string]string
@@ -239,6 +243,7 @@ type State struct {
 	adminUserByName map[string]string
 	adminSessions   map[string]AdminSession
 	logsDirty       bool
+	logGeneration   uint64
 	lastLogPersist  time.Time
 	dataFile        string
 }
@@ -755,6 +760,8 @@ func (s *State) ensureBootstrapAdminLocked(adminUsername, adminPassword string) 
 	return nil
 }
 
+var dummyPasswordHash, _ = bcrypt.GenerateFromPassword([]byte("dummy-timing-defense"), bcrypt.DefaultCost)
+
 func (s *State) AuthenticateAdminUser(username, password string) (AdminUser, error) {
 	normalizedUsername := normalizeAdminUsername(username)
 	if normalizedUsername == "" || strings.TrimSpace(password) == "" {
@@ -765,11 +772,13 @@ func (s *State) AuthenticateAdminUser(username, password string) (AdminUser, err
 	userID, ok := s.adminUserByName[normalizedUsername]
 	if !ok {
 		s.mu.RUnlock()
+		bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(password))
 		return AdminUser{}, errors.New("用户名或密码错误")
 	}
 	user, exists := s.adminUsers[userID]
 	s.mu.RUnlock()
 	if !exists || !user.Enabled {
+		bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(password))
 		return AdminUser{}, errors.New("用户已禁用")
 	}
 	if !verifyPassword(user.PasswordHash, password) {
@@ -777,6 +786,8 @@ func (s *State) AuthenticateAdminUser(username, password string) (AdminUser, err
 	}
 	return user, nil
 }
+
+const maxSessionsPerUser = 10
 
 func (s *State) CreateAdminSession(userID string) (string, error) {
 	buf := make([]byte, 32)
@@ -793,6 +804,23 @@ func (s *State) CreateAdminSession(userID string) (string, error) {
 		return "", errors.New("用户不存在或已禁用")
 	}
 
+	userSessionCount := 0
+	var oldestToken string
+	var oldestExpiry time.Time
+	for t, sess := range s.adminSessions {
+		if sess.UserID != userID {
+			continue
+		}
+		userSessionCount++
+		if oldestToken == "" || sess.ExpiresAt.Before(oldestExpiry) {
+			oldestToken = t
+			oldestExpiry = sess.ExpiresAt
+		}
+	}
+	if userSessionCount >= maxSessionsPerUser && oldestToken != "" {
+		delete(s.adminSessions, oldestToken)
+	}
+
 	s.adminSessions[token] = AdminSession{
 		UserID:    user.ID,
 		Username:  user.Username,
@@ -800,6 +828,17 @@ func (s *State) CreateAdminSession(userID string) (string, error) {
 		ExpiresAt: time.Now().Add(24 * time.Hour),
 	}
 	return token, nil
+}
+
+func (s *State) CleanupExpiredSessions() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for token, session := range s.adminSessions {
+		if now.After(session.ExpiresAt) {
+			delete(s.adminSessions, token)
+		}
+	}
 }
 
 func (s *State) ValidateAdminSession(token string) (AdminSession, bool) {
@@ -1010,33 +1049,30 @@ func (s *State) DeleteAdminUser(userID string) error {
 func defaultUANormalizationConfig() UANormalizationConfig {
 	return UANormalizationConfig{
 		Enabled:            true,
-		UnknownPassthrough: true,
+		UnknownPassthrough: false,
 		Rules: []UANormalizationRule{
-			{
-				CanonicalClass: "clashforandroid_premium",
-				BucketKey:      "clashforandroid_premium",
-				AllContains:    []string{"clashforandroid", "premium"},
-			},
-			{
-				CanonicalClass: "clashforandroid_mihomo",
-				BucketKey:      "clashforandroid_mihomo",
-				AllContains:    []string{"clashforandroid", "mihomo"},
-			},
-			{
-				CanonicalClass: "clashforandroid_meta",
-				BucketKey:      "clashforandroid_meta",
-				AllContains:    []string{"clashforandroid", "meta"},
-			},
-			{
-				CanonicalClass: "clash_meta_core",
-				BucketKey:      "clash_meta_core",
-				AnyContains:    []string{"flclash", "clash-verge"},
-			},
-			{
-				CanonicalClass: "v2ray_family",
-				BucketKey:      "v2ray_family",
-				AnyContains:    []string{"v2rayn", "v2raya", "v2rayng"},
-			},
+			{CanonicalClass: "blocked_social_bot", BucketKey: "__blocked__", AnyContains: []string{"telegrambot", "twitterbot", "facebookexternalhit", "discordbot", "slackbot", "whatsapp", "linkedinbot", "pinterestbot", "redditbot"}},
+			{CanonicalClass: "blocked_ai_crawler", BucketKey: "__blocked__", AnyContains: []string{"gptbot", "chatgpt-user", "oai-searchbot", "chatgpt-operator", "claudebot", "claude-web", "claude-user", "claude-searchbot", "claude-code", "anthropic-ai", "perplexitybot", "perplexity-user", "cohere-ai", "cohere-training-data-crawler", "grokbot", "grok ", "deepseekbot", "ccbot", "bytespider", "baiduspider", "google-extended", "duckassistbot", "youbot", "pangubot", "mistralai-user", "ai2bot", "img2dataset"}},
+			{CanonicalClass: "blocked_search_engine", BucketKey: "__blocked__", AnyContains: []string{"googlebot", "bingbot", "yandexbot", "sogou", "semrushbot", "ahrefsbot", "mj12bot", "dotbot", "rogerbot", "screaming frog"}},
+			{CanonicalClass: "tool_passthrough", BucketKey: "__default__", AnyContains: []string{"curl/", "python-requests", "python-urllib", "wget/", "httpie/", "go-http-client", "okhttp/", "java/", "postman", "insomnia/"}},
+			{CanonicalClass: "singbox_family", BucketKey: "singbox_family", AnyContains: []string{"sing-box", "sfa/", "sfi/", "sfm/"}},
+			{CanonicalClass: "clash_meta_android", BucketKey: "clash_meta_android", AllContains: []string{"clashmetaforandroid"}},
+			{CanonicalClass: "clashforandroid_premium", BucketKey: "clashforandroid_premium", AllContains: []string{"clashforandroid", "premium"}},
+			{CanonicalClass: "clashforandroid_mihomo", BucketKey: "clashforandroid_mihomo", AllContains: []string{"clashforandroid", "mihomo"}},
+			{CanonicalClass: "clashforandroid_meta", BucketKey: "clashforandroid_meta", AllContains: []string{"clashforandroid", "meta"}},
+			{CanonicalClass: "clash_meta_core", BucketKey: "clash_meta_core", AnyContains: []string{"flclash", "clash-verge", "clash-nyanpasu", "clashx meta", "mihomo-party", "clash.meta"}},
+			{CanonicalClass: "clashx_family", BucketKey: "clashx_family", AnyContains: []string{"clashx/", "clashx pro"}},
+			{CanonicalClass: "shadowrocket", BucketKey: "shadowrocket", AnyContains: []string{"shadowrocket"}},
+			{CanonicalClass: "quantumult_x", BucketKey: "quantumult_x", AnyContains: []string{"quantumult%20x", "quantumult x", "quantumultx"}},
+			{CanonicalClass: "surge_family", BucketKey: "surge_family", AnyContains: []string{"surge/", "surge "}},
+			{CanonicalClass: "stash_ios", BucketKey: "stash_ios", AnyContains: []string{"stash/", "stash "}},
+			{CanonicalClass: "loon_ios", BucketKey: "loon_ios", AnyContains: []string{"loon/", "loon "}},
+			{CanonicalClass: "v2ray_family", BucketKey: "v2ray_family", AnyContains: []string{"v2rayn", "v2raya", "v2rayng", "v2ray/"}},
+			{CanonicalClass: "hiddify", BucketKey: "hiddify", AnyContains: []string{"hiddify"}},
+			{CanonicalClass: "nekobox_family", BucketKey: "nekobox_family", AnyContains: []string{"nekobox", "nekoray"}},
+			{CanonicalClass: "surfboard", BucketKey: "surfboard", AnyContains: []string{"surfboard"}},
+			{CanonicalClass: "hysteria_family", BucketKey: "hysteria_family", AnyContains: []string{"hysteria/", "hy2/"}},
+			{CanonicalClass: "browser_generic", BucketKey: "__default__", AnyContains: []string{"mozilla/", "chrome/", "safari/", "firefox/", "edge/", "opera/"}},
 		},
 	}
 }
@@ -1129,6 +1165,14 @@ func mapRawUAToCanonicalClass(userAgent string, config UANormalizationConfig) (s
 	if !config.Enabled {
 		return ua, nil
 	}
+	if ua == cacheVariantUnknown || ua == cacheVariantDefault {
+		return ua, nil
+	}
+	for idx := range config.Rules {
+		if config.Rules[idx].BucketKey == ua {
+			return config.Rules[idx].CanonicalClass, &config.Rules[idx]
+		}
+	}
 	lowerUA := strings.ToLower(ua)
 	for idx := range config.Rules {
 		rule := &config.Rules[idx]
@@ -1220,10 +1264,16 @@ func (s *State) ResolveUAMatchDetails(userAgent string) UAMatchDetails {
 	return resolveUAMatchDetails(userAgent, s.config.UANormalization)
 }
 
+const maxCacheBodySize = 10 << 20 // 10MB
+
 func (s *State) SetCache(upstreamID, userAgent string, cache *CachedSubscription) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if cache == nil {
+		return
+	}
+	if len(cache.Body) > maxCacheBodySize {
+		log.Printf("缓存体过大，跳过缓存 upstream=%s size=%d", upstreamID, len(cache.Body))
 		return
 	}
 	uaKey := s.normalizeUAVariantLocked(userAgent)
@@ -1470,6 +1520,9 @@ func (s *State) GetUpstreamUACacheStatuses(upstreamID string) []UACacheStatus {
 			if seenAt, exists := seenMap[uaKey]; exists {
 				lastSeenAt := seenAt
 				item.LastSeenAt = &lastSeenAt
+				expiresAt := seenAt.Add(time.Duration(activeDays) * 24 * time.Hour)
+				item.ExpiresAt = &expiresAt
+				item.IsExpiringSoon = time.Until(expiresAt) < 7*24*time.Hour
 			}
 		}
 		stats := requestStats[uaKey]
@@ -1586,6 +1639,7 @@ func (s *State) AppendClientLog(entry ClientUpdateLog) error {
 
 	s.cleanupLogsLocked()
 	s.logsDirty = true
+	s.logGeneration++
 
 	if len(s.logs)%logPersistEvery == 0 || time.Since(s.lastLogPersist) >= logPersistMaxDelay {
 		return s.saveLocked()
@@ -1760,6 +1814,18 @@ func (s *State) LogCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.logs)
+}
+
+func (s *State) LogCountByUpstreamScope(allowedUpstreamIDs map[string]struct{}) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	count := 0
+	for _, entry := range s.logs {
+		if _, ok := allowedUpstreamIDs[entry.UpstreamID]; ok {
+			count++
+		}
+	}
+	return count
 }
 
 func (s *State) GetGlobalConfig() GlobalConfig {
@@ -2047,11 +2113,7 @@ func (s *State) load() error {
 	return nil
 }
 
-func (s *State) saveLocked() error {
-	if err := os.MkdirAll(filepath.Dir(s.dataFile), 0o700); err != nil {
-		return err
-	}
-
+func (s *State) serializeLocked() ([]byte, error) {
 	upstreams := make([]Upstream, 0, len(s.upstreams))
 	for _, u := range s.upstreams {
 		upstreams = append(upstreams, u)
@@ -2093,8 +2155,11 @@ func (s *State) saveLocked() error {
 			}
 		}
 	}
-	data, err := json.MarshalIndent(persisted, "", "  ")
-	if err != nil {
+	return json.MarshalIndent(persisted, "", "  ")
+}
+
+func (s *State) persistToFile(data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(s.dataFile), 0o700); err != nil {
 		return err
 	}
 
@@ -2121,19 +2186,36 @@ func (s *State) saveLocked() error {
 	}
 
 	if err := os.Rename(tmpFilePath, s.dataFile); err != nil {
-		if removeErr := os.Remove(s.dataFile); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			_ = os.Remove(tmpFilePath)
-			return fmt.Errorf("替换状态文件失败: %w", err)
-		}
-		if errRetry := os.Rename(tmpFilePath, s.dataFile); errRetry != nil {
-			_ = os.Remove(tmpFilePath)
-			return fmt.Errorf("状态文件原子写入失败: %w", errRetry)
-		}
+		_ = os.Remove(tmpFilePath)
+		return fmt.Errorf("状态文件原子写入失败: %w", err)
 	}
 
-	s.logsDirty = false
-	s.lastLogPersist = time.Now()
+	if dirFd, err := os.Open(filepath.Dir(s.dataFile)); err == nil {
+		_ = dirFd.Sync()
+		_ = dirFd.Close()
+	}
+
 	return nil
+}
+
+func (s *State) saveLocked() error {
+	data, err := s.serializeLocked()
+	if err != nil {
+		return err
+	}
+	genAtSerialize := s.logGeneration
+	s.persistMu.Lock()
+	s.mu.Unlock()
+	persistErr := s.persistToFile(data)
+	s.persistMu.Unlock()
+	s.mu.Lock()
+	if persistErr == nil {
+		if s.logGeneration == genAtSerialize {
+			s.logsDirty = false
+		}
+		s.lastLogPersist = time.Now()
+	}
+	return persistErr
 }
 
 func cloneCache(src *CachedSubscription) *CachedSubscription {

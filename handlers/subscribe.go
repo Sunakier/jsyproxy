@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -149,9 +150,13 @@ type SubscribeHandler struct {
 	refreshMutex      sync.Map
 	loginMu           sync.Mutex
 	loginAttempts     map[string]loginAttempt
+	globalLoginCount  int
+	globalLoginReset  time.Time
 	nodeStatusMu      sync.RWMutex
 	nodeStatusCache   map[string]nodeStatusCacheEntry
 	nodeStatusRunning map[string]bool
+	ctx               context.Context
+	cancel            context.CancelFunc
 }
 
 type loginAttempt struct {
@@ -161,7 +166,7 @@ type loginAttempt struct {
 }
 
 type nodeStatusFetchResponse struct {
-	Data []map[string]interface{} `json:"data"`
+	Data []map[string]any `json:"data"`
 }
 
 type nodeStatusCacheEntry struct {
@@ -180,26 +185,104 @@ type refreshLockValue struct {
 }
 
 const (
-	refreshContentionTimeout = 10 * time.Second
-	nodeStatusCacheTTL       = 10 * time.Minute
-	maxLoginFailures         = 5
-	loginBlockDuration       = 5 * time.Minute
-	loginFailureWindow       = 15 * time.Minute
+	refreshContentionTimeout       = 10 * time.Second
+	nodeStatusCacheTTL             = 10 * time.Minute
+	maxLoginFailures               = 5
+	loginBlockDuration             = 5 * time.Minute
+	loginFailureWindow             = 15 * time.Minute
+	maxACLRulesetFetches           = 50
+	maxAdminRequestBodySize  int64 = 1 << 20 // 1MB
+	globalLoginMaxPerMinute        = 30
 )
+
+func maskSecret(s string) string {
+	if len(s) <= 8 {
+		return "****"
+	}
+	return s[:4] + "****" + s[len(s)-4:]
+}
+
+func maskUpstreamsForAPI(upstreams []store.Upstream) []store.Upstream {
+	result := make([]store.Upstream, len(upstreams))
+	for i, u := range upstreams {
+		result[i] = u
+		if u.Authorization != "" {
+			result[i].Authorization = maskSecret(u.Authorization)
+		}
+	}
+	return result
+}
 
 func NewSubscribeHandler(cfg *config.Config) (*SubscribeHandler, error) {
 	state, err := store.New(cfg.DataFile, cfg.BootstrapAccessKeys, cfg.DefaultRefreshInterval, cfg.AdminUsername, cfg.AdminPassword)
 	if err != nil {
 		return nil, err
 	}
-	return &SubscribeHandler{
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &SubscribeHandler{
 		config:            cfg,
-		httpClient:        utils.NewHTTPClient(),
+		httpClient:        utils.NewSafeHTTPClient(cfg.AllowPrivateUpstreams),
 		state:             state,
 		loginAttempts:     make(map[string]loginAttempt),
 		nodeStatusCache:   make(map[string]nodeStatusCacheEntry),
 		nodeStatusRunning: make(map[string]bool),
-	}, nil
+		ctx:               ctx,
+		cancel:            cancel,
+	}
+	go h.runSessionCleanupLoop()
+	go h.runLoginAttemptsCleanupLoop()
+	return h, nil
+}
+
+func (h *SubscribeHandler) Shutdown() {
+	h.cancel()
+}
+
+func (h *SubscribeHandler) runSessionCleanupLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("session清理循环panic recovered: %v", r)
+		}
+	}()
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-h.ctx.Done():
+			return
+		case <-ticker.C:
+			h.state.CleanupExpiredSessions()
+		}
+	}
+}
+
+func (h *SubscribeHandler) runLoginAttemptsCleanupLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("登录限流清理循环panic recovered: %v", r)
+		}
+	}()
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-h.ctx.Done():
+			return
+		case <-ticker.C:
+			h.cleanupLoginAttempts()
+		}
+	}
+}
+
+func (h *SubscribeHandler) cleanupLoginAttempts() {
+	h.loginMu.Lock()
+	defer h.loginMu.Unlock()
+	now := time.Now()
+	for ip, attempt := range h.loginAttempts {
+		if now.Sub(attempt.lastFailedAt) > loginFailureWindow && now.After(attempt.blockedUntil) {
+			delete(h.loginAttempts, ip)
+		}
+	}
 }
 
 func (h *SubscribeHandler) ValidateAdminSession(token string) (string, string, string, bool) {
@@ -228,6 +311,11 @@ func (h *SubscribeHandler) FlushState() error {
 }
 
 func (h *SubscribeHandler) runUpstreamRefreshLoop(upstreamID string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("上游刷新循环panic recovered upstream=%s: %v", upstreamID, r)
+		}
+	}()
 	if err := h.RefreshUpstreamCache(upstreamID, "startup", ""); err != nil {
 		log.Printf("启动预热缓存失败 upstream=%s: %v", upstreamID, err)
 	}
@@ -236,7 +324,12 @@ func (h *SubscribeHandler) runUpstreamRefreshLoop(upstreamID string) {
 	}
 	for {
 		interval := h.state.GetUpstreamRefreshInterval(upstreamID)
-		time.Sleep(interval)
+		select {
+		case <-h.ctx.Done():
+			log.Printf("停止上游刷新循环 upstream=%s (shutdown)", upstreamID)
+			return
+		case <-time.After(interval):
+		}
 
 		upstream, ok := h.state.GetUpstream(upstreamID)
 		if !ok || !upstream.Enabled || upstream.CacheStrategy != store.CacheStrategyForce {
@@ -292,36 +385,35 @@ func (h *SubscribeHandler) GetSubscribe(c *gin.Context) {
 
 	clientUA := c.GetHeader("User-Agent")
 	clientIP := c.ClientIP()
-	h.state.MarkUASeen(keyInfo.UpstreamID, clientUA)
 	clientUA = strings.TrimSpace(clientUA)
 	uaDetails := h.state.ResolveUAMatchDetails(clientUA)
 
+	if uaDetails.CacheBucket == "__blocked__" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "访问被拒绝"})
+		return
+	}
+
+	h.state.MarkUASeen(keyInfo.UpstreamID, clientUA)
+
 	cacheVariantUA := uaDetails.CacheBucket
-	cache, cacheHit := h.state.GetCache(keyInfo.UpstreamID, cacheVariantUA)
-	variantMiss := cacheVariantUA != "" && !cacheHit
+	cache, cacheHit := h.state.GetCache(keyInfo.UpstreamID, clientUA)
+	variantMiss := cacheVariantUA != "" && cacheVariantUA != "__default__" && !cacheHit
 	if !cacheHit && cacheVariantUA != "" {
 		if fallbackCache, fallbackHit := h.state.GetCache(keyInfo.UpstreamID, ""); fallbackHit {
 			cache = fallbackCache
 			cacheHit = true
-			cacheVariantUA = ""
 		}
 	}
 
 	needRefresh := false
 	if !cacheHit || variantMiss {
 		needRefresh = true
-	} else if upstream.CacheStrategy == store.CacheStrategyLazy && h.state.IsCacheExpired(keyInfo.UpstreamID, cacheVariantUA) {
+	} else if upstream.CacheStrategy == store.CacheStrategyLazy && h.state.IsCacheExpired(keyInfo.UpstreamID, clientUA) {
 		needRefresh = true
 	}
 
 	if needRefresh {
-		refreshUA := cacheVariantUA
-		if variantMiss {
-			refreshUA = clientUA
-		} else if !cacheHit {
-			refreshUA = ""
-		}
-		if err := h.RefreshUpstreamCache(keyInfo.UpstreamID, "request", refreshUA); err != nil {
+		if err := h.RefreshUpstreamCache(keyInfo.UpstreamID, "request", clientUA); err != nil {
 			h.appendClientLog(keyInfo.ID, keyInfo.Key, keyInfo.Name, keyInfo.UpstreamID, clientIP, clientUA, uaDetails, false, "failed", err.Error())
 			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 			return
@@ -619,6 +711,9 @@ func (h *SubscribeHandler) loadRulesFromConfigURL(configURL string) ([]string, e
 	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
 		return nil, errors.New("config仅支持http/https链接")
 	}
+	if err := utils.ValidateOutboundURL(parsed.String(), h.config.AllowPrivateUpstreams); err != nil {
+		return nil, fmt.Errorf("config链接校验失败: %w", err)
+	}
 	rules, err := h.fetchRulesFromConfig(parsed.String(), 0)
 	if err != nil {
 		return nil, err
@@ -630,7 +725,7 @@ func (h *SubscribeHandler) fetchRulesFromConfig(configURL string, depth int) ([]
 	if depth > 2 {
 		return nil, errors.New("config规则嵌套层级过深")
 	}
-	resp, err := h.httpClient.MakeRequest(http.MethodGet, configURL, map[string]string{})
+	resp, err := h.httpClient.MakeRequestWithContext(h.ctx, http.MethodGet, configURL, map[string]string{})
 	if err != nil {
 		return nil, fmt.Errorf("拉取config失败: %w", err)
 	}
@@ -638,14 +733,14 @@ func (h *SubscribeHandler) fetchRulesFromConfig(configURL string, depth int) ([]
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("拉取config失败: HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := utils.ReadLimited(resp.Body, utils.MaxConfigBodySize)
 	if err != nil {
 		return nil, fmt.Errorf("读取config失败: %w", err)
 	}
-	return h.parseRulesFromConfigBody(configURL, body, depth)
+	return h.parseRulesFromConfigBody(configURL, body)
 }
 
-func (h *SubscribeHandler) parseRulesFromConfigBody(baseURL string, body []byte, depth int) ([]string, error) {
+func (h *SubscribeHandler) parseRulesFromConfigBody(baseURL string, body []byte) ([]string, error) {
 	raw := string(body)
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -665,7 +760,7 @@ func parseRulesFromProviderYAML(raw string) []string {
 	if root == nil {
 		return nil
 	}
-	payload, ok := root["payload"].([]interface{})
+	payload, ok := root["payload"].([]any)
 	if !ok {
 		return nil
 	}
@@ -683,6 +778,7 @@ func parseRulesFromProviderYAML(raw string) []string {
 func (h *SubscribeHandler) parseRulesFromACLINI(baseURL, raw string) ([]string, error) {
 	lines := strings.Split(raw, "\n")
 	rules := make([]string, 0, len(lines)*2)
+	rulesetFetches := 0
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
@@ -719,11 +815,18 @@ func (h *SubscribeHandler) parseRulesFromACLINI(baseURL, raw string) ([]string, 
 				}
 			}
 		}
-		resp, err := h.httpClient.MakeRequest(http.MethodGet, sourceURL, map[string]string{})
+		if rulesetFetches >= maxACLRulesetFetches {
+			continue
+		}
+		rulesetFetches++
+		if err := utils.ValidateOutboundURL(sourceURL, h.config.AllowPrivateUpstreams); err != nil {
+			continue
+		}
+		resp, err := h.httpClient.MakeRequestWithContext(h.ctx, http.MethodGet, sourceURL, map[string]string{})
 		if err != nil {
 			continue
 		}
-		content, readErr := io.ReadAll(resp.Body)
+		content, readErr := utils.ReadLimited(resp.Body, utils.MaxConfigBodySize)
 		_ = resp.Body.Close()
 		if readErr != nil || resp.StatusCode != http.StatusOK {
 			continue
@@ -794,7 +897,7 @@ func dedupeRuleStrings(rules []string) []string {
 	return result
 }
 
-func (h *SubscribeHandler) RefreshUpstreamCache(upstreamID, reason, downstreamUA string) error {
+func (h *SubscribeHandler) RefreshUpstreamCache(upstreamID, reason, downstreamUA string) (retErr error) {
 	variantKey := h.state.NormalizeUAVariant(downstreamUA)
 	lockKey := makeRefreshLockKey(upstreamID, variantKey)
 
@@ -806,14 +909,19 @@ func (h *SubscribeHandler) RefreshUpstreamCache(upstreamID, reason, downstreamUA
 		case <-time.After(refreshContentionTimeout):
 			return errors.New("等待上游刷新超时，请稍后重试")
 		case <-h.waitForRefresh(lockKey):
-			// In-flight refresh completed - check if cache now exists
-			if cache, hit := h.state.GetCache(upstreamID, variantKey); hit && cache != nil {
+			if cache, hit := h.state.GetCache(upstreamID, downstreamUA); hit && cache != nil {
 				return nil
 			}
 			return errors.New("上游刷新未完成，缓存不可用")
 		}
 	}
-	defer h.releaseRefreshLock(lockKey, lockVal)
+	defer func() {
+		h.releaseRefreshLock(lockKey, lockVal)
+		if r := recover(); r != nil {
+			log.Printf("刷新缓存panic recovered upstream=%s reason=%s: %v", upstreamID, reason, r)
+			retErr = fmt.Errorf("刷新缓存内部错误: %v", r)
+		}
+	}()
 
 	upstream, ok := h.state.GetUpstream(upstreamID)
 	if !ok {
@@ -946,28 +1054,29 @@ func (h *SubscribeHandler) refreshMergeUpstreamCache(upstream store.Upstream, re
 	var err error
 	headers := filterAllowedPassthroughHeaders(passthroughHeaders)
 	ensureTrafficMetadataHeaders(headers, mergedTraffic)
-	if upstream.SubscriptionFormat == store.SubscriptionFormatClash || upstream.SubscriptionFormat == store.SubscriptionFormatClashMeta || upstream.SubscriptionFormat == store.SubscriptionFormatMihomo || upstream.SubscriptionFormat == store.SubscriptionFormatStash {
+	switch upstream.SubscriptionFormat {
+	case store.SubscriptionFormatClash, store.SubscriptionFormatClashMeta, store.SubscriptionFormatMihomo, store.SubscriptionFormatStash:
 		body, err = RenderClashSubscription(nodes, nil, upstream.ClashConfig)
 		if err != nil {
 			return err
 		}
 		setHeaderValues(headers, "Content-Type", []string{"text/yaml; charset=utf-8"})
 		deleteHeader(headers, "Content-Transfer-Encoding")
-	} else if upstream.SubscriptionFormat == store.SubscriptionFormatSurge {
+	case store.SubscriptionFormatSurge:
 		body, err = RenderSurgeSubscription(nodes)
 		if err != nil {
 			return err
 		}
 		setHeaderValues(headers, "Content-Type", []string{"text/plain; charset=utf-8"})
 		deleteHeader(headers, "Content-Transfer-Encoding")
-	} else if upstream.SubscriptionFormat == store.SubscriptionFormatSingBox {
+	case store.SubscriptionFormatSingBox:
 		body, err = RenderSingBoxSubscription(nodes, nil)
 		if err != nil {
 			return err
 		}
 		setHeaderValues(headers, "Content-Type", []string{"application/json; charset=utf-8"})
 		deleteHeader(headers, "Content-Transfer-Encoding")
-	} else {
+	default:
 		body, err = RenderStandardV2RaySubscription(nodes)
 		if err != nil {
 			return err
@@ -999,10 +1108,13 @@ func (h *SubscribeHandler) fetchSingleUpstreamContent(upstream store.Upstream, d
 	if strings.TrimSpace(upstream.APIEndpoint) == "" {
 		return nil, errors.New("请先配置API端点地址")
 	}
+	if err := utils.ValidateOutboundURL(upstream.APIEndpoint, h.config.AllowPrivateUpstreams); err != nil {
+		return nil, fmt.Errorf("API端点地址校验失败: %w", err)
+	}
 
 	headers := buildUpstreamRequestHeaders(upstream)
 
-	resp, err := h.httpClient.MakeRequest(http.MethodGet, upstream.APIEndpoint, headers)
+	resp, err := h.httpClient.MakeRequestWithContext(h.ctx, http.MethodGet, upstream.APIEndpoint, headers)
 	if err != nil {
 		return nil, fmt.Errorf("请求上游API失败: %w", err)
 	}
@@ -1018,6 +1130,9 @@ func (h *SubscribeHandler) fetchSingleUpstreamContent(upstream store.Upstream, d
 	if subscribeResp.Data.SubscribeURL == "" {
 		return nil, errors.New("上游响应缺少subscribe_url")
 	}
+	if err := utils.ValidateOutboundURL(subscribeResp.Data.SubscribeURL, h.config.AllowPrivateUpstreams); err != nil {
+		return nil, fmt.Errorf("订阅链接校验失败: %w", err)
+	}
 
 	fetchUA := strings.TrimSpace(downstreamUA)
 	if fetchUA == "" {
@@ -1027,7 +1142,7 @@ func (h *SubscribeHandler) fetchSingleUpstreamContent(upstream store.Upstream, d
 	if fetchUA != "" {
 		contentHeaders["User-Agent"] = fetchUA
 	}
-	contentResp, err := h.httpClient.MakeRequest(http.MethodGet, subscribeResp.Data.SubscribeURL, contentHeaders)
+	contentResp, err := h.httpClient.MakeRequestWithContext(h.ctx, http.MethodGet, subscribeResp.Data.SubscribeURL, contentHeaders)
 	if err != nil {
 		return nil, fmt.Errorf("请求订阅链接失败: %w", err)
 	}
@@ -1036,7 +1151,7 @@ func (h *SubscribeHandler) fetchSingleUpstreamContent(upstream store.Upstream, d
 		return nil, fmt.Errorf("订阅内容返回状态码: %d", contentResp.StatusCode)
 	}
 
-	body, err := io.ReadAll(contentResp.Body)
+	body, err := utils.ReadLimited(contentResp.Body, utils.MaxSubscriptionBodySize)
 	if err != nil {
 		return nil, fmt.Errorf("读取订阅内容失败: %w", err)
 	}
@@ -1139,7 +1254,7 @@ func (h *SubscribeHandler) AdminLogin(c *gin.Context) {
 		return
 	}
 	h.recordAdminLoginSuccess(clientIP)
-	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetSameSite(http.SameSiteStrictMode)
 	c.SetCookie("admin_session", token, 86400, "/admin", "", h.shouldUseSecureCookie(c), true)
 	effectivePermissions := h.state.EffectivePermissions(user.ID)
 	scopeMode := user.UpstreamScopeMode
@@ -1161,7 +1276,7 @@ func (h *SubscribeHandler) AdminLogout(c *gin.Context) {
 	if token, err := c.Cookie("admin_session"); err == nil {
 		h.state.DeleteAdminSession(token)
 	}
-	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetSameSite(http.SameSiteStrictMode)
 	c.SetCookie("admin_session", "", -1, "/admin", "", h.shouldUseSecureCookie(c), true)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -1171,7 +1286,7 @@ func (h *SubscribeHandler) AdminStatus(c *gin.Context) {
 	upstreams := h.filterUpstreamsByCurrentUser(c, h.state.ListUpstreams())
 	allowedUpstreamIDs := h.currentAllowedUpstreamIDs(c)
 	filteredKeys := h.filterKeysByCurrentUser(c, h.state.ListKeys())
-	filteredLogs := h.state.ListLogsByUpstreamScope(0, allowedUpstreamIDs)
+	logCount := h.state.LogCountByUpstreamScope(allowedUpstreamIDs)
 	upstreamStatuses := make([]gin.H, 0, len(upstreams))
 
 	for _, u := range upstreams {
@@ -1198,10 +1313,7 @@ func (h *SubscribeHandler) AdminStatus(c *gin.Context) {
 
 		if hasCache {
 			used := cache.TrafficStatus.UsedUpload + cache.TrafficStatus.UsedDownload
-			daysUntilReset := cache.TrafficStatus.ResetDay
-			if daysUntilReset < 0 {
-				daysUntilReset = 0
-			}
+			daysUntilReset := max(cache.TrafficStatus.ResetDay, 0)
 			status["cache_updated_at"] = cache.UpdatedAt.Format(time.RFC3339)
 			status["traffic"] = gin.H{
 				"plan_name":        cache.TrafficStatus.PlanName,
@@ -1225,7 +1337,7 @@ func (h *SubscribeHandler) AdminStatus(c *gin.Context) {
 		"upstreams":      upstreamStatuses,
 		"upstream_count": len(upstreams),
 		"key_count":      len(filteredKeys),
-		"log_count":      len(filteredLogs),
+		"log_count":      logCount,
 		"global_config":  h.state.GetGlobalConfig(),
 	})
 }
@@ -1292,6 +1404,12 @@ func (h *SubscribeHandler) AdminCacheStatus(c *gin.Context) {
 			if item.LastSeenAt != nil {
 				entry["last_seen_at"] = item.LastSeenAt.Format(time.RFC3339)
 			}
+			if item.ExpiresAt != nil {
+				entry["expires_at"] = item.ExpiresAt.Format(time.RFC3339)
+			}
+			if item.IsExpiringSoon {
+				entry["is_expiring_soon"] = true
+			}
 			items = append(items, entry)
 		}
 
@@ -1316,7 +1434,7 @@ func (h *SubscribeHandler) AdminCacheStatus(c *gin.Context) {
 }
 
 func (h *SubscribeHandler) AdminListUpstreams(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"upstreams": h.filterUpstreamsByCurrentUser(c, h.state.ListUpstreams())})
+	c.JSON(http.StatusOK, gin.H{"upstreams": maskUpstreamsForAPI(h.filterUpstreamsByCurrentUser(c, h.state.ListUpstreams()))})
 }
 
 func (h *SubscribeHandler) AdminAddUpstream(c *gin.Context) {
@@ -1397,7 +1515,9 @@ func (h *SubscribeHandler) AdminUpdateUpstream(c *gin.Context) {
 	existing.APIEndpoint = strings.TrimSpace(req.APIEndpoint)
 	existing.NodeStatusAPIEndpoint = strings.TrimSpace(req.NodeStatusAPIEndpoint)
 	existing.NodeStatusRefreshInterval = strings.TrimSpace(req.NodeStatusRefreshInterval)
-	existing.Authorization = strings.TrimSpace(req.Authorization)
+	if !strings.Contains(req.Authorization, "****") {
+		existing.Authorization = strings.TrimSpace(req.Authorization)
+	}
 	existing.RequestUserAgent = strings.TrimSpace(req.RequestUserAgent)
 	existing.Host = strings.TrimSpace(req.Host)
 	existing.Origin = strings.TrimSpace(req.Origin)
@@ -1485,16 +1605,17 @@ func (h *SubscribeHandler) AdminDeleteUpstreamUACache(c *gin.Context) {
 func (h *SubscribeHandler) AdminGetSettings(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"global_config": h.state.GetGlobalConfig(),
-		"upstreams":     h.filterUpstreamsByCurrentUser(c, h.state.ListUpstreams()),
+		"upstreams":     maskUpstreamsForAPI(h.filterUpstreamsByCurrentUser(c, h.state.ListUpstreams())),
 	})
 }
 
 func (h *SubscribeHandler) AdminUpdateSettings(c *gin.Context) {
 	var req globalConfigRequest
 	// Use custom JSON decoder to reject unknown fields
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxAdminRequestBodySize)
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求体过大或读取失败"})
 		return
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
@@ -1524,9 +1645,10 @@ func (h *SubscribeHandler) AdminExportUARules(c *gin.Context) {
 
 func (h *SubscribeHandler) AdminImportUARules(c *gin.Context) {
 	var req uaRulesImportRequest
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxAdminRequestBodySize)
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求体过大或读取失败"})
 		return
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
@@ -1576,9 +1698,10 @@ func (h *SubscribeHandler) AdminExportGlobalConfig(c *gin.Context) {
 
 func (h *SubscribeHandler) AdminImportGlobalConfig(c *gin.Context) {
 	var req globalConfigImportRequest
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxAdminRequestBodySize)
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求体过大或读取失败"})
 		return
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
@@ -2097,6 +2220,18 @@ func (h *SubscribeHandler) allowAdminLogin(clientIP string) (bool, int) {
 	h.loginMu.Lock()
 	defer h.loginMu.Unlock()
 
+	now := time.Now()
+
+	if now.After(h.globalLoginReset) {
+		h.globalLoginCount = 0
+		h.globalLoginReset = now.Add(1 * time.Minute)
+	}
+	if h.globalLoginCount >= globalLoginMaxPerMinute {
+		retryAfter := max(int(h.globalLoginReset.Sub(now).Seconds()), 1)
+		return false, retryAfter
+	}
+	h.globalLoginCount++
+
 	if strings.TrimSpace(clientIP) == "" {
 		return true, 0
 	}
@@ -2106,7 +2241,6 @@ func (h *SubscribeHandler) allowAdminLogin(clientIP string) (bool, int) {
 		return true, 0
 	}
 
-	now := time.Now()
 	if now.After(attempt.blockedUntil) {
 		if now.Sub(attempt.lastFailedAt) > loginFailureWindow {
 			delete(h.loginAttempts, clientIP)
@@ -2115,10 +2249,7 @@ func (h *SubscribeHandler) allowAdminLogin(clientIP string) (bool, int) {
 		return true, 0
 	}
 
-	retryAfter := int(attempt.blockedUntil.Sub(now).Seconds())
-	if retryAfter < 1 {
-		retryAfter = 1
-	}
+	retryAfter := max(int(attempt.blockedUntil.Sub(now).Seconds()), 1)
 	return false, retryAfter
 }
 
@@ -2327,6 +2458,14 @@ func (h *SubscribeHandler) triggerNodeStatusRefresh(upstream store.Upstream, rea
 	h.nodeStatusMu.Unlock()
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("节点状态刷新panic recovered upstream=%s: %v", upstreamID, r)
+				h.nodeStatusMu.Lock()
+				delete(h.nodeStatusRunning, upstreamID)
+				h.nodeStatusMu.Unlock()
+			}
+		}()
 		nodes, total, online, err := h.fetchUpstreamNodeStatus(upstream)
 		now := time.Now()
 
@@ -2417,9 +2556,12 @@ func (h *SubscribeHandler) fetchUpstreamNodeStatus(upstream store.Upstream) ([]g
 	if endpoint == "" {
 		return nil, 0, 0, nil
 	}
+	if err := utils.ValidateOutboundURL(endpoint, h.config.AllowPrivateUpstreams); err != nil {
+		return nil, 0, 0, fmt.Errorf("节点状态API地址校验失败: %w", err)
+	}
 
 	headers := buildUpstreamRequestHeaders(upstream)
-	resp, err := h.httpClient.MakeRequest(http.MethodGet, endpoint, headers)
+	resp, err := h.httpClient.MakeRequestWithContext(h.ctx, http.MethodGet, endpoint, headers)
 	if err != nil {
 		return nil, 0, 0, fmt.Errorf("请求节点状态API失败: %w", err)
 	}
@@ -2429,8 +2571,12 @@ func (h *SubscribeHandler) fetchUpstreamNodeStatus(upstream store.Upstream) ([]g
 		return nil, 0, 0, fmt.Errorf("节点状态API返回状态码: %d", resp.StatusCode)
 	}
 
+	nodeBody, err := utils.ReadLimited(resp.Body, utils.MaxAPIJSONSize)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("读取节点状态响应失败: %w", err)
+	}
 	var payload nodeStatusFetchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if err := json.Unmarshal(nodeBody, &payload); err != nil {
 		return nil, 0, 0, fmt.Errorf("解析节点状态响应失败: %w", err)
 	}
 
@@ -2463,7 +2609,7 @@ func (h *SubscribeHandler) fetchUpstreamNodeStatus(upstream store.Upstream) ([]g
 	return nodes, len(nodes), onlineCount, nil
 }
 
-func normalizeNodeStatusID(raw interface{}) string {
+func normalizeNodeStatusID(raw any) string {
 	switch v := raw.(type) {
 	case string:
 		return strings.TrimSpace(v)
@@ -2478,7 +2624,7 @@ func normalizeNodeStatusID(raw interface{}) string {
 	}
 }
 
-func normalizeNodeStatusString(raw interface{}) string {
+func normalizeNodeStatusString(raw any) string {
 	if raw == nil {
 		return ""
 	}
@@ -2488,7 +2634,7 @@ func normalizeNodeStatusString(raw interface{}) string {
 	return strings.TrimSpace(fmt.Sprint(raw))
 }
 
-func normalizeNodeStatusOnline(raw interface{}) bool {
+func normalizeNodeStatusOnline(raw any) bool {
 	switch v := raw.(type) {
 	case bool:
 		return v
@@ -2509,7 +2655,7 @@ func normalizeNodeStatusOnline(raw interface{}) bool {
 	}
 }
 
-func normalizeNodeStatusUnix(raw interface{}) int64 {
+func normalizeNodeStatusUnix(raw any) int64 {
 	switch v := raw.(type) {
 	case float64:
 		return int64(v)

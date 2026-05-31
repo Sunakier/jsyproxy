@@ -486,6 +486,7 @@
         .tag-blue { background: rgba(59, 130, 246, 0.1); color: var(--primary); }
         .tag-green { background: rgba(16, 185, 129, 0.1); color: var(--success); }
         .tag-red { background: rgba(239, 68, 68, 0.1); color: var(--danger); }
+        .tag-orange { background: rgba(245, 158, 11, 0.1); color: #d97706; }
         .tag-gray { background: rgba(107, 114, 128, 0.1); color: var(--text-muted); }
         .tag-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; margin-right: 6px; }
         .bg-success { background-color: var(--success); }
@@ -715,7 +716,7 @@
         async function api(path, options = {}) {
             const res = await fetch('/admin/api' + path, {
                 credentials: 'include',
-                headers: { 'Content-Type': 'application/json', ...options.headers },
+                headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', ...options.headers },
                 ...options
             });
             const data = await res.json().catch(() => ({}));
@@ -1408,6 +1409,21 @@
                     ? new Date(item.last_seen_at).toLocaleString()
                     : '-';
 
+                let expiryBadge = '';
+                if (item.expires_at) {
+                    const expiresAt = new Date(item.expires_at);
+                    const now = new Date();
+                    if (expiresAt < now) {
+                        expiryBadge = '<span class="tag tag-red">已过期</span>';
+                    } else if (item.is_expiring_soon) {
+                        const daysLeft = Math.ceil((expiresAt - now) / (1000*60*60*24));
+                        expiryBadge = `<span class="tag tag-orange">${daysLeft}天后过期</span>`;
+                    } else {
+                        const daysLeft = Math.ceil((expiresAt - now) / (1000*60*60*24));
+                        expiryBadge = `<span class="tag tag-gray">${daysLeft}天后过期</span>`;
+                    }
+                }
+
                 const actionBtn = item.is_default
                     ? '<span class="text-sm text-muted">-</span>'
                     : (canWriteUpstream
@@ -1417,7 +1433,7 @@
                 return `
                     <tr>
                         <td>
-                            <div>${uaDisplay}</div>
+                            <div>${uaDisplay} ${expiryBadge}</div>
                             <div class="ua-cache-meta">更新: ${updatedTime}</div>
                             <div class="ua-cache-meta">最近访问: ${lastSeenTime}</div>
                         </td>

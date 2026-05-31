@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"jsyproxy/config"
 	"jsyproxy/handlers"
 	"jsyproxy/middleware"
@@ -10,6 +11,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,9 +29,23 @@ func main() {
 
 	// 创建Gin路由器
 	router := gin.New()
+	router.SetTrustedProxies(nil)
 
-	// 添加日志中间件
-	router.Use(gin.Logger())
+	var tokenSanitizer = regexp.MustCompile(`token=[^&]*`)
+	router.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
+		path := param.Path
+		if strings.Contains(path, "token=") {
+			path = tokenSanitizer.ReplaceAllString(path, "token=****")
+		}
+		return fmt.Sprintf("[GIN] %s | %3d | %13v | %15s | %-7s %s\n",
+			param.TimeStamp.Format("2006/01/02 - 15:04:05"),
+			param.StatusCode,
+			param.Latency,
+			param.ClientIP,
+			param.Method,
+			path,
+		)
+	}))
 	router.Use(gin.Recovery())
 
 	// 创建订阅处理器
@@ -43,10 +60,9 @@ func main() {
 	router.GET("/admin", subscribeHandler.AdminPage)
 	router.POST("/admin/api/login", subscribeHandler.AdminLogin)
 
-	adminAuth := middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission)
-	adminAPI := router.Group("/admin/api", adminAuth)
+	adminAPI := router.Group("/admin/api")
 	{
-		adminAPI.POST("/logout", subscribeHandler.AdminLogout)
+		adminAPI.POST("/logout", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission), subscribeHandler.AdminLogout)
 		adminAPI.GET("/status", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionAdminRead), subscribeHandler.AdminStatus)
 		adminAPI.GET("/cache-status", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionUpstreamRead), subscribeHandler.AdminCacheStatus)
 		adminAPI.GET("/settings", middleware.AdminAuth(subscribeHandler.ValidateAdminSession, subscribeHandler.HasPermission, store.PermissionAdminRead), subscribeHandler.AdminGetSettings)
@@ -119,6 +135,8 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("优雅停机失败: %v", err)
 	}
+
+	subscribeHandler.Shutdown()
 
 	if err := subscribeHandler.FlushState(); err != nil {
 		log.Printf("停机前刷新状态失败: %v", err)
