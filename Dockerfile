@@ -7,15 +7,17 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" -a -installsuffix cgo -o jsyproxy .
 
 FROM alpine:latest
-RUN apk --no-cache add ca-certificates wget && \
-    adduser -D -H -h /app appuser && \
+RUN apk --no-cache add ca-certificates wget su-exec && \
+    adduser -D -H -h /app -u 1000 appuser && \
     mkdir -p /app/data && \
     chown -R appuser:appuser /app
 WORKDIR /app
 COPY --from=builder /app/jsyproxy .
-RUN chown appuser:appuser /app/jsyproxy
-USER appuser
+COPY docker-entrypoint.sh .
+RUN chmod +x /app/jsyproxy /app/docker-entrypoint.sh
+VOLUME /app/data
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD wget --spider -q http://localhost:3000/admin || exit 1
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["./jsyproxy"]
